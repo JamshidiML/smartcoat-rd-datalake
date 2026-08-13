@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smartcoat.local/contracts/review-decision.schema.json",
+  "title": "SmartCoat Human Review Decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["review_decision_id", "silver_draft_id", "ingestion_id", "reviewer_user_id", "reviewed_at_utc", "decision", "explicit_confirmation", "correction_summary", "self_review_detected", "solo_exception_applied", "administrator_exception_reason"],
+  "properties": {
+    "review_decision_id": {"type": "string", "format": "uuid"},
+    "silver_draft_id": {"type": "string", "format": "uuid"},
+    "ingestion_id": {"type": "string", "format": "uuid"},
+    "reviewer_user_id": {"type": "string", "pattern": "^usr_[A-Za-z0-9_-]+$"},
+    "reviewed_at_utc": {"type": "string", "format": "date-time"},
+    "decision": {"enum": ["APPROVED_NO_CHANGES", "APPROVED_WITH_CORRECTIONS", "REJECTED_UNREADABLE", "REJECTED_WRONG_DOCUMENT_TYPE", "REQUIRES_REUPLOAD"]},
+    "explicit_confirmation": {"const": true},
+    "correction_summary": {"type": "string"},
+    "self_review_detected": {"type": "boolean"},
+    "solo_exception_applied": {"type": "boolean"},
+    "administrator_exception_reason": {"type": ["string", "null"]}
+  }
+}
