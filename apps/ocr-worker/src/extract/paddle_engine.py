@@ -5,28 +5,45 @@ import os
 from pathlib import Path
 from typing import Any
 
-# PaddlePaddle 3.3.x's PIR executor cannot convert some PP-OCR model
-# attributes for oneDNN CPU inference. Set the PIR flag before importing
-# PaddleOCR and also disable oneDNN explicitly in the pipeline options.
+from preprocess.documents import MAX_IMAGE_SIDE, PREPROCESSING_VERSION
+
+# PaddlePaddle 3.3.x regressed oneDNN CPU inference for PP-OCR models.
+# Pin 3.2.2 and keep the legacy IR flag explicit before importing PaddleOCR.
 RUNTIME_FLAGS = {"FLAGS_enable_pir_api": "0"}
 for name, value in RUNTIME_FLAGS.items():
     os.environ.setdefault(name, value)
 
-from paddleocr import PaddleOCR
+from paddleocr import PaddleOCR  # noqa: E402 - runtime flag must be set before Paddle import
 
 
-ENGINE_VERSION = "paddleocr-3.7.0+paddlepaddle-3.3.1"
+ENGINE_VERSION = "paddleocr-3.7.0+paddlepaddle-3.2.2"
+PROFILE = os.getenv("OCR_PIPELINE_PROFILE", "fast").strip().lower()
+PROFILE_OPTIONS = {
+    "fast": {
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+    },
+    "accurate": {
+        "use_doc_orientation_classify": True,
+        "use_doc_unwarping": True,
+        "use_textline_orientation": True,
+    },
+}
+if PROFILE not in PROFILE_OPTIONS:
+    raise ValueError(f"Unsupported OCR_PIPELINE_PROFILE: {PROFILE}")
+
 PIPELINE_KWARGS = {
     "device": "cpu",
     "lang": "german",
-    "use_doc_orientation_classify": True,
-    "use_doc_unwarping": True,
-    "use_textline_orientation": True,
-    "enable_mkldnn": False,
+    "enable_mkldnn": True,
+    **PROFILE_OPTIONS[PROFILE],
 }
 CONFIGURATION = {
     **PIPELINE_KWARGS,
     "pipeline": "general_ocr",
+    "profile": PROFILE,
+    "preprocessing": {"version": PREPROCESSING_VERSION, "max_image_side": MAX_IMAGE_SIDE},
     "runtime_flags": RUNTIME_FLAGS,
 }
 

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
     <title>SmartCoat R&D Lake</title>
-    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/styles.css?v=fast-pipeline-1">
   </head>
   <body>
     <header>
@@ -65,7 +65,7 @@
         </section>
 
         <section id="review-view" class="view hidden">
-          <div id="draft-list" class="card"></div>
+          <div id="draft-list" class="card" aria-live="polite"></div>
           <div id="review-editor" class="card hidden">
             <div class="section-heading">
               <div><p class="eyebrow">MANDATORY HUMAN REVIEW</p><h2 id="review-title">Review source</h2></div>
@@ -92,10 +92,10 @@
           </div>
         </section>
 
-        <section id="activity-view" class="view card hidden"><h2>Ingestion activity</h2><div id="activity-list"></div></section>
+        <section id="activity-view" class="view card hidden"><h2>Ingestion activity</h2><div id="activity-list" aria-live="polite"></div></section>
       </div>
       <div id="message" role="status" aria-live="polite"></div>
     </main>
-    <script src="/app.js" defer></script>
+    <script src="/app.js?v=fast-pipeline-1" defer></script>
   </body>
 </html>

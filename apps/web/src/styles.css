@@ -38,10 +38,18 @@ input:focus, select:focus, textarea:focus { outline: 3px solid rgba(23,107,77,.1
 .section-heading { display: flex; justify-content: space-between; align-items: start; gap: 20px; }
 .status { display: inline-block; border-radius: 999px; padding: 5px 10px; background: #e4efe8; color: var(--green-dark); font-size: .74rem; font-weight: 800; white-space: nowrap; }
 .status.warning { color: var(--amber); background: #f8ead1; }
+.status.processing { color: #315c87; background: #e3edf7; }
+.status.ready { color: var(--green-dark); background: #dcefe4; }
+.status.error { color: #8d2f27; background: #f7dfdc; }
 .notice { padding: 10px 12px; border-left: 3px solid #8eaa70; background: #f0f4ec; color: var(--muted); font-size: .84rem; }
 .queue-item, .activity-item { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 15px 0; border-top: 1px solid var(--line); }
 .queue-item:first-of-type, .activity-item:first-of-type { border-top: 0; }
 .queue-item p, .activity-item p { margin: 0; }
+.activity-detail { color: var(--muted); font-size: .84rem; }
+.pipeline-wait { display: flex; align-items: center; gap: 15px; padding: 18px; border: 1px solid #c8d9e7; border-radius: 12px; background: #f3f8fc; }
+.pipeline-wait p { margin: 2px 0 0; color: var(--muted); }
+.pipeline-spinner { width: 25px; height: 25px; flex: 0 0 auto; border: 3px solid #c8d9e7; border-top-color: #315c87; border-radius: 50%; animation: pipeline-spin .8s linear infinite; }
+@keyframes pipeline-spin { to { transform: rotate(360deg); } }
 .mono { color: var(--muted); font: .78rem ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
 .preview { display: grid; place-items: center; min-height: 360px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: #eceae3; }
 .preview img, .preview iframe { width: 100%; height: 520px; object-fit: contain; border: 0; }
@@ -52,3 +60,4 @@ dt { color: var(--muted); } dd { margin: 0; word-break: break-all; }
 #message { position: fixed; right: 22px; bottom: 22px; max-width: 420px; padding: 13px 16px; border-radius: 9px; background: var(--ink); color: white; box-shadow: var(--shadow); opacity: 0; pointer-events: none; transition: opacity .2s; }
 #message.visible { opacity: 1; }
 @media (max-width: 780px) { .two-column, .review-grid { grid-template-columns: 1fr; } header { align-items: start; } .review-grid { gap: 38px; } }
+@media (prefers-reduced-motion: reduce) { .pipeline-spinner { animation: none; } }

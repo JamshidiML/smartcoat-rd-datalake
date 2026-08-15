@@ -7,9 +7,13 @@ import numpy as np
 from PIL import Image, ImageEnhance, ImageOps
 
 
-def normalize_image(source: Path, destination: Path) -> Path:
+def normalize_image(source: Path, destination: Path, max_side: int) -> Path:
     image = Image.open(source)
     image = ImageOps.exif_transpose(image).convert("RGB")
+    if max(image.size) > max_side:
+        scale = max_side / max(image.size)
+        resized = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+        image = image.resize(resized, Image.Resampling.LANCZOS)
     image = ImageOps.autocontrast(image, cutoff=1)
     image = ImageEnhance.Contrast(image).enhance(1.1)
 

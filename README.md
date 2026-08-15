@@ -21,6 +21,8 @@ Gold data, dashboards, ML discovery, embeddings, vector databases, SmartCoat int
 
 MinIO is available only on `http://127.0.0.1:9000`; its local console is `http://127.0.0.1:9001`. The API is `http://127.0.0.1:8000`. See [the local deployment runbook](docs/runbooks/VPS_DEPLOYMENT.md) for bootstrap, credential rotation, backup, and troubleshooting.
 
+Activity and Review queue update automatically while OCR is queued or processing. The local default is `OCR_PIPELINE_PROFILE=fast`: deterministic EXIF normalization, a 2400-pixel long-edge cap, contrast normalization, and deskew run before Paddle detection/recognition, without the three expensive orientation/unwarping models. Set `OCR_PIPELINE_PROFILE=accurate` and rebuild the worker only when a difficult skewed or distorted batch justifies the slower profile. Every OCR run records the selected profile and preprocessing version in PostgreSQL and its raw artifact.
+
 ## Quality gates
 
 ```bash

@@ -409,9 +409,21 @@ class PostgresRepository:
         with self.connection() as connection:
             rows = connection.execute(
                 """
-                SELECT ingestion_id, original_filename, document_category, state, uploaded_at_utc,
-                    source_sha256, duplicate_of_ingestion_id
-                FROM uploads ORDER BY uploaded_at_utc DESC
+                SELECT u.ingestion_id, u.original_filename, u.document_category, u.state,
+                    u.uploaded_at_utc, u.source_sha256, u.duplicate_of_ingestion_id,
+                    j.status AS ocr_job_status, j.queued_at_utc AS ocr_queued_at_utc,
+                    j.started_at_utc AS ocr_started_at_utc,
+                    j.completed_at_utc AS ocr_completed_at_utc,
+                    j.attempt_count AS ocr_attempt_count,
+                    CASE WHEN j.status = 'FAILED' THEN j.error_reason END AS ocr_error_reason
+                FROM uploads u
+                LEFT JOIN LATERAL (
+                    SELECT status, queued_at_utc, started_at_utc, completed_at_utc,
+                        attempt_count, error_reason
+                    FROM ocr_jobs WHERE ingestion_id = u.ingestion_id
+                    ORDER BY queued_at_utc DESC LIMIT 1
+                ) j ON true
+                ORDER BY u.uploaded_at_utc DESC
                 """
             ).fetchall()
             return [dict(row) for row in rows]
@@ -452,6 +464,44 @@ class PostgresRepository:
                 """
             ).fetchone()
             return dict(row) if row else None
+
+    def recover_interrupted_ocr_jobs(self) -> int:
+        with self.connection() as connection:
+            jobs = connection.execute(
+                """
+                SELECT j.ocr_job_id, j.ingestion_id
+                FROM ocr_jobs j JOIN uploads u USING (ingestion_id)
+                WHERE j.status = 'RUNNING' AND u.state = 'OCR_QUEUED'
+                FOR UPDATE OF j
+                """
+            ).fetchall()
+            for job in jobs:
+                connection.execute(
+                    """
+                    UPDATE ocr_runs SET status = 'FAILED', completed_at_utc = now()
+                    WHERE ocr_job_id = %s AND status = 'RUNNING'
+                    """,
+                    (job["ocr_job_id"],),
+                )
+                connection.execute(
+                    """
+                    UPDATE ocr_jobs SET status = 'QUEUED', started_at_utc = NULL,
+                        completed_at_utc = NULL, error_reason = NULL
+                    WHERE ocr_job_id = %s AND status = 'RUNNING'
+                    """,
+                    (job["ocr_job_id"],),
+                )
+                self._audit(
+                    connection,
+                    "ocr-worker",
+                    "OCR_JOB",
+                    str(job["ocr_job_id"]),
+                    "OCR_JOB_RECOVERED",
+                    "RUNNING",
+                    "QUEUED",
+                    {"ingestion_id": str(job["ingestion_id"]), "reason": "worker restart"},
+                )
+            return len(jobs)
 
     def mark_ocr_failed(self, ingestion_id: str, reason: str) -> None:
         with self.connection() as connection:
