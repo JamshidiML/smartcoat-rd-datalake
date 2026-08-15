@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from database import PostgresRepository
-from domain import ARTIFACTS_BUCKET, ORIGINALS_BUCKET, OCRDomainService
+from domain import ARTIFACTS_BUCKET, ORIGINALS_BUCKET, OCRDomainService, StateConflict
 from extract.excel import extract_workbook
 from extract.paddle_engine import CONFIGURATION, ENGINE_VERSION, PaddleEngine
 from extract.tesseract_benchmark import benchmark
@@ -70,7 +70,12 @@ def process_job(job: dict[str, object], service: OCRDomainService, storage: Mini
         year, month = source_key.split("/")[1:3]
         for index, image in enumerate(images, start=1):
             key = f"rd/{year}/{month}/{ingestion_id}/preprocessed/page-{index:04d}.png"
-            storage.put_once(ARTIFACTS_BUCKET, key, image.read_bytes(), "image/png", locked=False)
+            image_bytes = image.read_bytes()
+            try:
+                storage.put_once(ARTIFACTS_BUCKET, key, image_bytes, "image/png", locked=False)
+            except StateConflict:
+                if storage.get(ARTIFACTS_BUCKET, key) != image_bytes:
+                    raise
 
         if PADDLE is None:
             PADDLE = PaddleEngine()

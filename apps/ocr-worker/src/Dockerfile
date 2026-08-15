@@ -13,9 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /opt/paddle-home /opt/paddle-models
 COPY requirements.txt /worker/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+RUN FLAGS_enable_pir_api=0 python -c "from paddleocr import PaddleOCR; PaddleOCR(lang='german', device='cpu', use_doc_orientation_classify=True, use_doc_unwarping=True, use_textline_orientation=True, enable_mkldnn=False)"
+ENV FLAGS_enable_pir_api=0
 COPY --from=api-source database.py domain.py identifiers.py storage.py validation.py /worker/
 COPY . /worker
-RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(lang='german', device='cpu', use_doc_orientation_classify=True, use_doc_unwarping=True, use_textline_orientation=True)"
 RUN useradd --create-home --uid 10002 worker \
     && chown -R worker:worker /worker /opt/paddle-home /opt/paddle-models
 USER worker

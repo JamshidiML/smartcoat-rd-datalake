@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
+
+# PaddlePaddle 3.3.x's PIR executor cannot convert some PP-OCR model
+# attributes for oneDNN CPU inference. Set the PIR flag before importing
+# PaddleOCR and also disable oneDNN explicitly in the pipeline options.
+RUNTIME_FLAGS = {"FLAGS_enable_pir_api": "0"}
+for name, value in RUNTIME_FLAGS.items():
+    os.environ.setdefault(name, value)
 
 from paddleocr import PaddleOCR
 
@@ -14,10 +22,12 @@ PIPELINE_KWARGS = {
     "use_doc_orientation_classify": True,
     "use_doc_unwarping": True,
     "use_textline_orientation": True,
+    "enable_mkldnn": False,
 }
 CONFIGURATION = {
     **PIPELINE_KWARGS,
     "pipeline": "general_ocr",
+    "runtime_flags": RUNTIME_FLAGS,
 }
 
 

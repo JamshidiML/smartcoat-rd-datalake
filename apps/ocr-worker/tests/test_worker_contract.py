@@ -26,6 +26,19 @@ class WorkerContractTests(unittest.TestCase):
         self.assertIn("PADDLE.extract(images)", worker)
         self.assertIn("benchmark(images)", worker)
 
+    def test_retry_reuses_only_identical_preprocessed_artifacts(self) -> None:
+        worker = (ROOT / "apps/ocr-worker/src/jobs/worker.py").read_text()
+        self.assertIn("except StateConflict:", worker)
+        self.assertIn("storage.get(ARTIFACTS_BUCKET, key) != image_bytes", worker)
+
+    def test_paddle_cpu_runtime_avoids_broken_onednn_pir_path(self) -> None:
+        engine = (ROOT / "apps/ocr-worker/src/extract/paddle_engine.py").read_text()
+        dockerfile = (ROOT / "apps/ocr-worker/src/Dockerfile").read_text()
+        self.assertLess(engine.index("FLAGS_enable_pir_api"), engine.index("from paddleocr import PaddleOCR"))
+        self.assertIn('"enable_mkldnn": False', engine)
+        self.assertIn("FLAGS_enable_pir_api=0", dockerfile)
+        self.assertIn("enable_mkldnn=False", dockerfile)
+
     def test_no_external_ocr_or_vision_api(self) -> None:
         source = "\n".join(
             path.read_text(errors="replace")

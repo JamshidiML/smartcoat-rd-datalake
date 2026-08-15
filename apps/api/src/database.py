@@ -459,5 +459,9 @@ class PostgresRepository:
                 "UPDATE ocr_jobs SET status = 'FAILED', error_reason = %s, completed_at_utc = now() WHERE ingestion_id = %s AND status IN ('QUEUED', 'RUNNING')",
                 (reason[:1000], ingestion_id),
             )
+            connection.execute(
+                "UPDATE ocr_runs SET status = 'FAILED', completed_at_utc = now() WHERE ingestion_id = %s AND status = 'RUNNING'",
+                (ingestion_id,),
+            )
         upload = self.get_upload(ingestion_id)
         self.transition(ingestion_id, upload["state"], "OCR_FAILED", "ocr-worker", {"reason": reason[:500]})
