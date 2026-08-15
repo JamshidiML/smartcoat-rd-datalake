@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smartcoat.local/contracts/silver-verified-record.schema.json",
+  "title": "SmartCoat Verified Silver Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["silver_record_id", "silver_revision", "ingestion_id", "source_sha256", "status", "verified_text", "reviewer_user_id", "reviewed_at_utc", "review_decision", "correction_summary", "review_evidence"],
+  "properties": {
+    "silver_record_id": {"type": "string", "format": "uuid"},
+    "silver_revision": {"type": "integer", "minimum": 1},
+    "ingestion_id": {"type": "string", "format": "uuid"},
+    "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "status": {"const": "VERIFIED"},
+    "verified_text": {"type": "string", "minLength": 1},
+    "reviewer_user_id": {"type": "string", "pattern": "^usr_[A-Za-z0-9_-]+$"},
+    "reviewed_at_utc": {"type": "string", "format": "date-time"},
+    "review_decision": {"enum": ["APPROVED_NO_CHANGES", "APPROVED_WITH_CORRECTIONS"]},
+    "correction_summary": {"type": "string"},
+    "review_evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_object_key", "ocr_artifact_key"],
+      "properties": {"source_object_key": {"type": "string", "minLength": 1}, "ocr_artifact_key": {"type": "string", "minLength": 1}}
+    }
+  }
+}

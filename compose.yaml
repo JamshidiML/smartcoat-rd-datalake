@@ -1,0 +1,138 @@
+name: smartcoat-rd-datalake
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+    ports:
+      - "127.0.0.1:${HOST_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ${POSTGRES_DATA_DIR:-./.local-data/postgres}:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 30s
+      retries: 20
+      start_period: 20s
+    networks: [backend, edge]
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "127.0.0.1:${HOST_MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${HOST_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - ${MINIO_DATA_DIR:-./.local-data/minio}:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 30s
+      retries: 20
+      start_period: 20s
+    networks: [backend, edge]
+
+  minio-bootstrap:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_APP_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY}
+      MINIO_APP_SECRET_KEY: ${MINIO_APP_SECRET_KEY}
+      MINIO_OCR_ACCESS_KEY: ${MINIO_OCR_ACCESS_KEY}
+      MINIO_OCR_SECRET_KEY: ${MINIO_OCR_SECRET_KEY}
+      MINIO_BACKUP_ACCESS_KEY: ${MINIO_BACKUP_ACCESS_KEY}
+      MINIO_BACKUP_SECRET_KEY: ${MINIO_BACKUP_SECRET_KEY}
+    volumes:
+      - ./infra/minio:/bootstrap:ro
+    entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+    restart: "no"
+    networks: [backend]
+
+  api:
+    build:
+      context: ./apps/api/src
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      MINIO_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_APP_SECRET_KEY}
+      LOCAL_USER_ID: ${LOCAL_USER_ID:-usr_founder}
+      LOCAL_USER_DISPLAY_NAME: ${LOCAL_USER_DISPLAY_NAME:-SmartCoat Founder}
+      LOCAL_USER_EMAIL: ${LOCAL_USER_EMAIL:-founder@localhost}
+      LOCAL_USER_PASSWORD: ${LOCAL_USER_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET}
+      ALLOW_PHASE_1_SOLO_SELF_REVIEW: ${ALLOW_PHASE_1_SOLO_SELF_REVIEW:-true}
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://127.0.0.1:8080}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
+    ports:
+      - "127.0.0.1:${HOST_API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 30s
+      retries: 20
+      start_period: 20s
+    networks: [backend, edge]
+
+  web:
+    build:
+      context: ./apps/web/src
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${HOST_WEB_PORT:-8080}:8080"
+    networks: [edge]
+
+  ocr-worker:
+    platform: linux/amd64
+    build:
+      context: ./apps/ocr-worker/src
+      additional_contexts:
+        api-source: ./apps/api/src
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      MINIO_ACCESS_KEY: ${MINIO_OCR_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_OCR_SECRET_KEY}
+      OCR_POLL_SECONDS: ${OCR_POLL_SECONDS:-3}
+      OCR_LANGUAGES: ${OCR_LANGUAGES:-en,de}
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+    networks: [backend]
+
+networks:
+  backend:
+    name: smartcoat-rd-backend
+    internal: true
+  edge:
+    name: smartcoat-rd-localhost-edge

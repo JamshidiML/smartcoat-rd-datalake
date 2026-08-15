@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smartcoat.local/contracts/silver-draft.schema.json",
+  "title": "SmartCoat Silver Draft",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["silver_draft_id", "ingestion_id", "source_sha256", "ocr_run_id", "status", "extracted_text", "text_blocks", "source_file_type", "document_category", "extraction_engine", "extraction_engine_version", "created_at_utc"],
+  "properties": {
+    "silver_draft_id": {"type": "string", "format": "uuid"},
+    "ingestion_id": {"type": "string", "format": "uuid"},
+    "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ocr_run_id": {"type": "string", "format": "uuid"},
+    "status": {"const": "DRAFT_UNVERIFIED"},
+    "extracted_text": {"type": "string"},
+    "text_blocks": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["block_id", "page", "bounding_box", "text", "ocr_confidence"],
+        "properties": {
+          "block_id": {"type": "string"}, "page": {"type": "integer", "minimum": 1},
+          "bounding_box": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+          "text": {"type": "string"}, "ocr_confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    },
+    "source_file_type": {"enum": ["PHOTO", "PDF", "EXCEL"]},
+    "document_category": {"enum": ["LAB_NOTE", "TEST_RESULT", "FORMULATION_SCREEN", "MATERIAL_DOCUMENT", "OTHER"]},
+    "extraction_engine": {"enum": ["paddleocr", "openpyxl"]},
+    "extraction_engine_version": {"type": "string", "minLength": 1},
+    "created_at_utc": {"type": "string", "format": "date-time"}
+  }
+}
