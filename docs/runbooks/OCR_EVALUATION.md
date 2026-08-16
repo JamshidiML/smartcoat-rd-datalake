@@ -8,12 +8,14 @@ PaddleOCR is the production extractor; Tesseract is a benchmark against the exac
 
 - EXIF orientation normalization.
 - PDF rasterization at 300 DPI.
-- deterministic autocontrast and a bounded deskew attempt.
-- PaddleOCR 3.7.0 / PaddlePaddle 3.3.1, CPU, German Latin model with orientation, unwarping, and text-line orientation.
+- deterministic 2400-pixel long-edge cap, autocontrast, and bounded deskew attempt.
+- PaddleOCR 3.7.0 / PaddlePaddle 3.2.2, CPU with oneDNN, German Latin model. The default `fast` profile relies on deterministic orientation/deskew preprocessing and runs text detection plus recognition. The optional `accurate` profile also runs Paddle orientation, unwarping, and text-line-orientation models. PaddlePaddle 3.3.x is intentionally excluded because its oneDNN/PIR regression breaks PP-OCR CPU inference.
 - Tesseract 5.3.0, `deu+eng`, page segmentation mode 6.
 - Native Excel extraction records sheets, coordinates, displayed/formula values and explicitly makes no laboratory interpretation; image OCR benchmarking is not applicable to a native workbook.
 
 Raw engine result, configuration, version, time, source SHA-256, and output SHA-256 remain linked in PostgreSQL and `sc-rd-ocr-artifacts`.
+
+Use one profile for an entire evaluation batch and record it in the report. `fast` is the Apple-Silicon local-pilot default. Switch to `accurate` only for a separate measured batch; do not mix profiles silently or claim a speed/quality comparison without human reference transcriptions.
 
 ## Batch procedure
 

@@ -7,11 +7,12 @@ import time
 from pathlib import Path
 
 from database import PostgresRepository
-from domain import ARTIFACTS_BUCKET, ORIGINALS_BUCKET, OCRDomainService
+from domain import ARTIFACTS_BUCKET, ORIGINALS_BUCKET, OCRDomainService, StateConflict
 from extract.excel import extract_workbook
 from extract.paddle_engine import CONFIGURATION, ENGINE_VERSION, PaddleEngine
 from extract.tesseract_benchmark import benchmark
 from minio import Minio
+from preprocess.documents import MAX_IMAGE_SIDE, PREPROCESSING_VERSION, preprocess_source
 from storage import MinioObjectStorage
 
 PADDLE: PaddleEngine | None = None
@@ -28,6 +29,9 @@ def main() -> None:
     storage = MinioObjectStorage(client)
     service = OCRDomainService(repository)
     delay = int(os.getenv("OCR_POLL_SECONDS", "3"))
+    recovered = repository.recover_interrupted_ocr_jobs()
+    if recovered:
+        print(f"Recovered {recovered} interrupted OCR job(s).", flush=True)
     while True:
         job = repository.claim_next_job()
         if not job:
@@ -36,7 +40,9 @@ def main() -> None:
         try:
             process_job(job, service, storage)
         except Exception as exc:  # worker boundary records a terminal, auditable failure
-            repository.mark_ocr_failed(job["ingestion_id"], f"{type(exc).__name__}: {exc}")
+            reason = f"{type(exc).__name__}: {exc}"
+            print(f"OCR failed for ingestion {job['ingestion_id']}: {reason}", flush=True)
+            repository.mark_ocr_failed(job["ingestion_id"], reason)
 
 
 def process_job(job: dict[str, object], service: OCRDomainService, storage: MinioObjectStorage) -> None:
@@ -64,13 +70,19 @@ def process_job(job: dict[str, object], service: OCRDomainService, storage: Mini
         root = Path(directory)
         source = root / f"source{extension}"
         source.write_bytes(source_bytes)
-        from preprocess.documents import preprocess_source
-
         images = preprocess_source(source, mime_type, root / "preprocessed")
         year, month = source_key.split("/")[1:3]
         for index, image in enumerate(images, start=1):
-            key = f"rd/{year}/{month}/{ingestion_id}/preprocessed/page-{index:04d}.png"
-            storage.put_once(ARTIFACTS_BUCKET, key, image.read_bytes(), "image/png", locked=False)
+            key = (
+                f"rd/{year}/{month}/{ingestion_id}/preprocessed/"
+                f"v{PREPROCESSING_VERSION}-max-{MAX_IMAGE_SIDE}/page-{index:04d}.png"
+            )
+            image_bytes = image.read_bytes()
+            try:
+                storage.put_once(ARTIFACTS_BUCKET, key, image_bytes, "image/png", locked=False)
+            except StateConflict:
+                if storage.get(ARTIFACTS_BUCKET, key) != image_bytes:
+                    raise
 
         if PADDLE is None:
             PADDLE = PaddleEngine()
