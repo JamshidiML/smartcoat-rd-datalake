@@ -80,6 +80,56 @@ class RetentionMetadataMigrationTests(unittest.TestCase):
             r"expected_retain_until_utc = retention_deadline_utc\(\s*"
             r"retention_class,\s*accepted_storage_at_utc\s*\)",
         )
+        self.assertRegex(
+            self.sql,
+            r"accepted_storage_at_utc = date_trunc\(\s*"
+            r"'second',\s*accepted_storage_at_utc\s*\)",
+        )
+
+    def test_approved_policy_version_seals_its_category_rules(self) -> None:
+        self.assertLess(
+            self.sql.index("INSERT INTO retention_category_rules"),
+            self.sql.index("INSERT INTO retention_policy_versions"),
+        )
+        self.assertRegex(
+            self.sql,
+            r"FOREIGN KEY \(retention_policy_version\) REFERENCES "
+            r"retention_policy_versions \(\s*retention_policy_version\s*\) "
+            r"DEFERRABLE INITIALLY DEFERRED",
+        )
+        self.assertIn("reject_rule_for_approved_retention_policy", self.sql)
+        self.assertIn("require_rules_before_retention_policy_approval", self.sql)
+        self.assertIn("pg_advisory_xact_lock", self.sql)
+        self.assertIn(
+            "Retention category rules are sealed for approved policy version",
+            self.sql,
+        )
+
+    def test_python_rules_match_seeded_database_rules_exactly(self) -> None:
+        seeded_rows = {
+            category: (
+                retention_class,
+                records_purpose,
+                legal_basis_classification,
+            )
+            for category, retention_class, records_purpose, legal_basis_classification
+            in re.findall(
+                r"\(\s*'smartcoat_retention_2026_08_v1',\s*"
+                r"'([A-Z][A-Z0-9_]+)',\s*"
+                r"'(permanent|long_term_10y|short_90d)',\s*"
+                r"'([^']+)',\s*'([^']+)'\s*\)",
+                self.sql,
+            )
+        }
+        python_rows = {
+            category: (
+                rule.retention_class,
+                rule.records_purpose,
+                rule.legal_basis_classification,
+            )
+            for category, rule in self.policy.approved_rules().items()
+        }
+        self.assertEqual(python_rows, seeded_rows)
 
     def test_policy_link_and_assignment_are_append_only(self) -> None:
         for table in (

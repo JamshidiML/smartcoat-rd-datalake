@@ -53,24 +53,8 @@ CREATE TABLE retention_policy_versions (
     approved_by text NOT NULL CHECK (btrim(approved_by) <> '')
 );
 
-INSERT INTO retention_policy_versions (
-    retention_policy_version,
-    policy_document_path,
-    policy_document_sha256,
-    approved_at_utc,
-    approved_by
-) VALUES (
-    'smartcoat_retention_2026_08_v1',
-    'docs/architecture/decisions/ADR-0002-retention-semantics-and-enforcement-contract.md',
-    '307ce9d9484b3819d16c5178a3dc61fb56e257376779e679e4923b1e7f5beb37',
-    TIMESTAMPTZ '2026-08-20T00:00:00Z',
-    'ratified_architecture_decision'
-);
-
 CREATE TABLE retention_category_rules (
-    retention_policy_version text NOT NULL REFERENCES retention_policy_versions (
-        retention_policy_version
-    ),
+    retention_policy_version text NOT NULL,
     data_category text NOT NULL CHECK (
         data_category ~ '^[A-Z][A-Z0-9_]{2,127}$'
     ),
@@ -82,8 +66,63 @@ CREATE TABLE retention_category_rules (
         btrim(legal_basis_classification) <> ''
     ),
     PRIMARY KEY (retention_policy_version, data_category),
-    UNIQUE (retention_policy_version, data_category, retention_class)
+    UNIQUE (retention_policy_version, data_category, retention_class),
+    FOREIGN KEY (retention_policy_version) REFERENCES retention_policy_versions (
+        retention_policy_version
+    ) DEFERRABLE INITIALLY DEFERRED
 );
+
+CREATE FUNCTION reject_rule_for_approved_retention_policy()
+RETURNS trigger LANGUAGE plpgsql AS $approved_policy_rule_guard$
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(
+            'smartcoat.retention_policy.' || NEW.retention_policy_version,
+            0
+        )
+    );
+
+    IF EXISTS (
+        SELECT 1
+        FROM retention_policy_versions
+        WHERE retention_policy_version = NEW.retention_policy_version
+    ) THEN
+        RAISE EXCEPTION 'Retention category rules are sealed for approved policy version';
+    END IF;
+
+    RETURN NEW;
+END;
+$approved_policy_rule_guard$;
+
+CREATE FUNCTION require_rules_before_retention_policy_approval()
+RETURNS trigger LANGUAGE plpgsql AS $policy_approval_guard$
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(
+            'smartcoat.retention_policy.' || NEW.retention_policy_version,
+            0
+        )
+    );
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM retention_category_rules
+        WHERE retention_policy_version = NEW.retention_policy_version
+    ) THEN
+        RAISE EXCEPTION 'Retention policy cannot be approved without category rules';
+    END IF;
+
+    RETURN NEW;
+END;
+$policy_approval_guard$;
+
+CREATE TRIGGER retention_category_rules_seal_approved_version
+BEFORE INSERT ON retention_category_rules
+FOR EACH ROW EXECUTE FUNCTION reject_rule_for_approved_retention_policy();
+
+CREATE TRIGGER retention_policy_versions_require_rules
+BEFORE INSERT ON retention_policy_versions
+FOR EACH ROW EXECUTE FUNCTION require_rules_before_retention_policy_approval();
 
 CREATE FUNCTION retention_deadline_utc(
     declared_retention_class text,
@@ -210,6 +249,23 @@ INSERT INTO retention_category_rules (
         'approved_operational_record'
     );
 
+-- A policy version becomes approved only after its complete rule set exists.
+-- The deferred foreign key permits this transaction-local population order;
+-- the paired advisory-lock triggers serialize rule insertion with approval.
+INSERT INTO retention_policy_versions (
+    retention_policy_version,
+    policy_document_path,
+    policy_document_sha256,
+    approved_at_utc,
+    approved_by
+) VALUES (
+    'smartcoat_retention_2026_08_v1',
+    'docs/architecture/decisions/ADR-0002-retention-semantics-and-enforcement-contract.md',
+    '307ce9d9484b3819d16c5178a3dc61fb56e257376779e679e4923b1e7f5beb37',
+    TIMESTAMPTZ '2026-08-20T00:00:00Z',
+    'ratified_architecture_decision'
+);
+
 CREATE TABLE bronze_retention_assignments (
     retention_assignment_id uuid PRIMARY KEY,
     bronze_object_id uuid NOT NULL UNIQUE REFERENCES bronze_objects (
@@ -247,6 +303,12 @@ CREATE TABLE bronze_retention_assignments (
     CHECK (
         expected_retain_until_utc = retention_deadline_utc(
             retention_class,
+            accepted_storage_at_utc
+        )
+    ),
+    CONSTRAINT bronze_retention_assignments_whole_second_anchor CHECK (
+        accepted_storage_at_utc = date_trunc(
+            'second',
             accepted_storage_at_utc
         )
     )
