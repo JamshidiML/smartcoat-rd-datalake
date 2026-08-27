@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import hashlib
+import ipaddress
 import json
 import os
 import signal
@@ -263,18 +264,33 @@ import sys
 
 api_host = sys.argv[1]
 api_port = int(sys.argv[2])
-for forbidden in sys.argv[3:]:
+separator = sys.argv.index("--tcp-targets")
+for forbidden in sys.argv[3:separator]:
     try:
         socket.getaddrinfo(forbidden, 1, type=socket.SOCK_STREAM)
     except socket.gaierror:
         continue
     raise SystemExit(30)
+denied_tcp = []
+for endpoint in sys.argv[separator + 1:]:
+    host, raw_port = endpoint.rsplit(":", 1)
+    try:
+        connection = socket.create_connection((host, int(raw_port)), timeout=2)
+    except OSError:
+        denied_tcp.append(endpoint)
+        continue
+    connection.close()
+    raise SystemExit(32)
 connection = socket.create_connection((api_host, api_port), timeout=3)
 payload = connection.recv(64)
 connection.close()
 if payload != b"synthetic-ok":
     raise SystemExit(31)
-print(json.dumps({"api_reachable": True, "backend_dns_denied": sorted(sys.argv[3:])}))
+print(json.dumps({
+    "api_reachable": True,
+    "backend_dns_denied": sorted(sys.argv[3:separator]),
+    "backend_tcp_denied": sorted(denied_tcp),
+}))
 """.strip()
 
 
@@ -312,7 +328,6 @@ class DisposableTopology:
         self.image_id = ""
         self._cleanup_installed = False
         self._finalized = False
-        self._constructed = False
         self._cleanup_error: str | None = None
 
     def _docker(self, *arguments: str, timeout: int = 60) -> CommandResult:
@@ -341,7 +356,6 @@ class DisposableTopology:
             self._docker("network", "create", "--internal", "--label", label, self.backend),
             "internal backend creation",
         )
-        self._constructed = True
         _require_success(
             self._docker("network", "create", "--label", label, self.edge),
             "edge creation",
@@ -436,6 +450,40 @@ class DisposableTopology:
             raise EnvironmentFailure("Docker returned an invalid network isolation value")
         return value == "true"
 
+    def _authenticated_backend_endpoint(self, container: str, port: int) -> str:
+        labels_result = _require_success(
+            self._docker("inspect", "--format", "{{json .Config.Labels}}", container),
+            "owned-container label inspection",
+        )
+        networks_result = _require_success(
+            self._docker(
+                "inspect",
+                "--format",
+                "{{json .NetworkSettings.Networks}}",
+                container,
+            ),
+            "owned-container address inspection",
+        )
+        try:
+            labels = json.loads(labels_result.stdout)
+            networks = json.loads(networks_result.stdout)
+        except json.JSONDecodeError as exc:
+            raise EnvironmentFailure("Docker returned malformed container metadata") from exc
+        if not isinstance(labels, dict) or labels.get(OWNER_LABEL) != self.owner:
+            raise IsolationFailure("backend endpoint does not belong to this acceptance run")
+        if not isinstance(networks, dict) or set(networks) != {self.backend}:
+            raise ProductContractFailure("backend endpoint has unexpected network membership")
+        address = networks[self.backend].get("IPAddress")
+        if not isinstance(address, str) or not address:
+            raise EnvironmentFailure("backend endpoint lacks an authenticated IPv4 address")
+        try:
+            parsed_address = ipaddress.IPv4Address(address)
+        except ipaddress.AddressValueError as exc:
+            raise EnvironmentFailure(
+                "backend endpoint did not return a literal IPv4 address"
+            ) from exc
+        return f"{parsed_address}:{port}"
+
     def verify(self) -> dict[str, Any]:
         expected_memberships = {
             self.postgres: {self.backend},
@@ -451,6 +499,11 @@ class DisposableTopology:
             raise ProductContractFailure("live backend network is not internal")
         if self._network_internal(self.edge):
             raise ProductContractFailure("live edge network unexpectedly is internal")
+
+        forbidden_tcp_targets = [
+            self._authenticated_backend_endpoint(self.postgres, 5432),
+            self._authenticated_backend_endpoint(self.minio, 9000),
+        ]
 
         deadline = time.monotonic() + 15
         positive: CommandResult | None = None
@@ -475,9 +528,11 @@ class DisposableTopology:
             "8000",
             self.postgres_alias,
             self.minio_alias,
+            "--tcp-targets",
+            *forbidden_tcp_targets,
         )
         if edge.returncode != 0:
-            raise ProductContractFailure("edge DNS/reachability boundary failed")
+            raise ProductContractFailure("edge DNS/TCP reachability boundary failed")
 
         egress = self._docker(
             "exec", self.postgres, "python", "-c", EGRESS_PROBE_CODE, timeout=15
@@ -491,6 +546,15 @@ class DisposableTopology:
             egress_evidence = json.loads(egress.stdout)
         except json.JSONDecodeError as exc:
             raise EnvironmentFailure("a synthetic probe returned malformed evidence") from exc
+        expected_edge_evidence = {
+            "api_reachable": True,
+            "backend_dns_denied": sorted(
+                [self.postgres_alias, self.minio_alias]
+            ),
+            "backend_tcp_denied": sorted(forbidden_tcp_targets),
+        }
+        if edge_evidence != expected_edge_evidence:
+            raise ProductContractFailure("edge denial evidence is incomplete")
 
         return {
             "allowed_backend_paths": positive_evidence,
@@ -526,23 +590,22 @@ class DisposableTopology:
             return
         self._finalized = True
         errors: list[str] = []
-        if self._constructed:
-            try:
-                containers = self._owned_container_ids()
-                if containers:
-                    result = self._docker("rm", "-f", *containers)
-                    if result.returncode != 0:
-                        errors.append("owned container removal failed")
-            except AcceptanceFailure:
-                errors.append("owned container inventory failed")
-            try:
-                networks = self._owned_network_ids()
-                if networks:
-                    result = self._docker("network", "rm", *networks)
-                    if result.returncode != 0:
-                        errors.append("owned network removal failed")
-            except AcceptanceFailure:
-                errors.append("owned network inventory failed")
+        try:
+            containers = self._owned_container_ids()
+            if containers:
+                result = self._docker("rm", "-f", *containers)
+                if result.returncode != 0:
+                    errors.append("owned container removal failed")
+        except BaseException:
+            errors.append("owned container inventory failed")
+        try:
+            networks = self._owned_network_ids()
+            if networks:
+                result = self._docker("network", "rm", *networks)
+                if result.returncode != 0:
+                    errors.append("owned network removal failed")
+        except BaseException:
+            errors.append("owned network inventory failed")
         self._cleanup_error = "; ".join(errors) or None
 
     def assert_clean(self) -> None:
@@ -558,21 +621,55 @@ def _parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(list(argv))
 
 
+def _finalize_and_reconcile(
+    harness: DisposableTopology,
+    before: dict[str, list[str]],
+    primary_error: BaseException | None,
+    *,
+    inventory: Callable[[], dict[str, list[str]]] = docker_inventory,
+) -> dict[str, list[str]]:
+    """Finalize fully and make any isolation failure the final classification."""
+
+    isolation_errors: list[str] = []
+    try:
+        harness.finalize()
+    except BaseException:
+        isolation_errors.append("owned-resource finalization raised unexpectedly")
+    try:
+        harness.assert_clean()
+    except BaseException as exc:
+        isolation_errors.append(str(exc) or "owned-resource cleanup was not verified")
+    after: dict[str, list[str]] | None = None
+    try:
+        after = inventory()
+    except BaseException:
+        isolation_errors.append("final Docker inventory could not be verified")
+    if after is not None and after != before:
+        isolation_errors.append("pre-existing Docker inventory changed")
+    if isolation_errors:
+        raise IsolationFailure("; ".join(isolation_errors))
+    if primary_error is not None:
+        raise primary_error
+    if after is None:  # pragma: no cover - guarded by isolation_errors above
+        raise IsolationFailure("final Docker inventory is unavailable")
+    return after
+
+
 def _run_live() -> dict[str, Any]:
     static_evidence = render_and_validate_compose()
     before = docker_inventory()
     harness = DisposableTopology()
     harness.install_cleanup()
+    primary_error: BaseException | None = None
+    image_id = ""
+    live_evidence: dict[str, Any] = {}
     try:
         image_id = harness.resolve_image()
         harness.construct()
         live_evidence = harness.verify()
-    finally:
-        harness.finalize()
-    harness.assert_clean()
-    after = docker_inventory()
-    if after != before:
-        raise IsolationFailure("pre-existing Docker inventory changed")
+    except BaseException as exc:
+        primary_error = exc
+    after = _finalize_and_reconcile(harness, before, primary_error)
     return {
         "classification": PASS,
         "compose_contract": static_evidence,

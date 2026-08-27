@@ -131,6 +131,86 @@ class NetworkContractTests(unittest.TestCase):
         self.assertIn("--pull=never", captured[0])
         self.assertIn(topology.image_id, captured[0])
 
+    def test_edge_probe_requires_direct_tcp_denial_and_api_reachability(self) -> None:
+        self.assertIn('sys.argv.index("--tcp-targets")', network.EDGE_PROBE_CODE)
+        self.assertIn(
+            "socket.create_connection((host, int(raw_port))", network.EDGE_PROBE_CODE
+        )
+        self.assertIn('"api_reachable": True', network.EDGE_PROBE_CODE)
+        self.assertIn(
+            '"backend_tcp_denied": sorted(denied_tcp)', network.EDGE_PROBE_CODE
+        )
+
+    def test_cleanup_mismatch_overrides_prior_product_failure(self) -> None:
+        events = []
+
+        class FakeHarness:
+            def finalize(self):
+                events.append("finalize")
+
+            def assert_clean(self):
+                events.append("assert_clean")
+                raise network.IsolationFailure("owned resource survived")
+
+        before = {"containers": [], "networks": [], "volumes": [], "images": []}
+
+        with self.assertRaises(network.IsolationFailure) as raised:
+            network._finalize_and_reconcile(
+                FakeHarness(),
+                before,
+                network.ProductContractFailure("probe failed"),
+                inventory=lambda: events.append("inventory") or before,
+            )
+
+        self.assertEqual("owned resource survived", str(raised.exception))
+        self.assertEqual(["finalize", "assert_clean", "inventory"], events)
+
+    def test_inventory_mismatch_overrides_prior_environment_failure(self) -> None:
+        events = []
+
+        class FakeHarness:
+            def finalize(self):
+                events.append("finalize")
+
+            def assert_clean(self):
+                events.append("assert_clean")
+
+        before = {"containers": [], "networks": [], "volumes": [], "images": []}
+        after = {**before, "containers": ["unexpected-container"]}
+
+        with self.assertRaises(network.IsolationFailure) as raised:
+            network._finalize_and_reconcile(
+                FakeHarness(),
+                before,
+                network.EnvironmentFailure("probe command failed"),
+                inventory=lambda: events.append("inventory") or after,
+            )
+
+        self.assertEqual("pre-existing Docker inventory changed", str(raised.exception))
+        self.assertEqual(["finalize", "assert_clean", "inventory"], events)
+
+    def test_finalize_attempts_all_owned_resource_cleanup_after_inventory_failure(self) -> None:
+        events = []
+
+        def fake_run(command, **_kwargs):
+            command = tuple(command)
+            if command[1:3] == ("ps", "-aq"):
+                events.append("containers")
+                return network.CommandResult(command, 1, "", "synthetic failure")
+            if command[1:3] == ("network", "ls"):
+                events.append("networks")
+                return network.CommandResult(command, 0, "network-id\n", "")
+            if command[1:3] == ("network", "rm"):
+                events.append("remove_network")
+                return network.CommandResult(command, 0, "network-id\n", "")
+            raise AssertionError(command)
+
+        topology = network.DisposableTopology(fake_run, token="offline")
+        topology.finalize()
+
+        self.assertEqual(["containers", "networks", "remove_network"], events)
+        self.assertEqual("owned container inventory failed", topology._cleanup_error)
+
     def test_evidence_fingerprint_is_order_independent_for_mapping_keys(self) -> None:
         first = {"networks": ["b", "a"], "containers": []}
         second = {"containers": [], "networks": ["b", "a"]}
