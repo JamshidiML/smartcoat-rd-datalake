@@ -24,6 +24,7 @@ LIFECYCLE_PATH = ROOT / "infra/postgres/tests/live_migration_lifecycle_acceptanc
 CANDIDATE_MIGRATION = (
     ROOT / "infra/postgres/migrations/0005__expand_retention_metadata.sql"
 )
+POLICY_MODULE_PATH = ROOT / "apps/api/src/retention_policy.py"
 EXPECTED_LIFECYCLE_SHA256 = (
     "4d7fbe8d33d36b6ff50161f4374cf16477667903253b790cbc37cb3e54707cfd"
 )
@@ -53,6 +54,22 @@ def load_lifecycle_module():
 
 
 lifecycle = load_lifecycle_module()
+
+
+def load_policy_module():
+    spec = importlib.util.spec_from_file_location(
+        "retention_policy_live_contract",
+        POLICY_MODULE_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(BLOCKED_IMPLEMENTATION_BOUNDARY)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+policy = load_policy_module()
 
 
 LEGACY_FIXTURE_SQL = """
@@ -232,6 +249,29 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
             and len(classes) == 3,
             "Canonical retention-class rows are not exact",
         )
+        database_rules = self._psql_rows(
+            "approved_category_rules",
+            "SELECT retention_policy_version, data_category, retention_class, "
+            "records_purpose, legal_basis_classification "
+            "FROM retention_category_rules ORDER BY data_category",
+        )
+        python_rules = sorted(
+            (
+                {
+                    "retention_policy_version": policy.RETENTION_POLICY_VERSION,
+                    "data_category": category,
+                    "retention_class": rule.retention_class,
+                    "records_purpose": rule.records_purpose,
+                    "legal_basis_classification": rule.legal_basis_classification,
+                }
+                for category, rule in policy.approved_rules().items()
+            ),
+            key=lambda row: row["data_category"],
+        )
+        self._require(
+            database_rules == python_rules,
+            "Approved PostgreSQL category rules differ from Python policy rules",
+        )
         deadlines = self._psql_rows(
             "deadline_semantics",
             """
@@ -258,6 +298,34 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
         if self.scenario == "fresh_volume":
             self._psql_success("install_post_migration_bronze_fixture", LEGACY_FIXTURE_SQL)
 
+        self._negative_insert(
+            "approved_policy_rule_insert_rejected",
+            """
+            INSERT INTO retention_category_rules (
+              retention_policy_version, data_category, retention_class,
+              records_purpose, legal_basis_classification
+            ) VALUES (
+              'smartcoat_retention_2026_08_v1', 'LATE_POLICY_MUTATION',
+              'permanent', 'Synthetic forbidden late rule',
+              'approved_non_personal_evidence'
+            )
+            """,
+            "Retention category rules are sealed for approved policy version",
+        )
+        self._negative_insert(
+            "empty_policy_approval_rejected",
+            """
+            INSERT INTO retention_policy_versions (
+              retention_policy_version, policy_document_path,
+              policy_document_sha256, approved_at_utc, approved_by
+            ) VALUES (
+              'synthetic_empty_policy_v1', 'synthetic/never-approved',
+              'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+              TIMESTAMPTZ '2026-08-20T00:00:00Z', 'synthetic_test'
+            )
+            """,
+            "Retention policy cannot be approved without category rules",
+        )
         self._negative_insert(
             "unknown_category_rejected",
             """
@@ -323,6 +391,28 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
             )
             """,
             "check constraint",
+        )
+        self._negative_insert(
+            "fractional_storage_anchor_rejected",
+            """
+            INSERT INTO bronze_retention_assignments (
+              retention_assignment_id, bronze_object_id, ingestion_id, bucket_name,
+              object_key, object_kind, object_version_id, data_category,
+              retention_class, retention_policy_version, retention_assigned_at_utc,
+              retention_assigned_by, accepted_storage_at_utc,
+              expected_retain_until_utc, legal_hold_required
+            ) VALUES (
+              '00000000-0000-7000-8000-000000000525',
+              '00000000-0000-7000-8000-000000000512',
+              '00000000-0000-7000-8000-000000000501',
+              'sc-rd-bronze-manifests', 'synthetic/cand-meta/manifest.json',
+              'MANIFEST', 'synthetic-version-manifest-1', 'LAB_NOTE', 'permanent',
+              'smartcoat_retention_2026_08_v1', TIMESTAMPTZ '2026-08-20T00:01:00Z',
+              'synthetic_rule', TIMESTAMPTZ '2026-08-20T00:00:00.123Z',
+              TIMESTAMPTZ '2036-08-20T00:00:00Z', true
+            )
+            """,
+            "bronze_retention_assignments_whole_second_anchor",
         )
 
         self._psql_success(
@@ -395,12 +485,16 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
                 "legacy_rows_equal": legacy_before == legacy_after,
                 "canonical_classes": sorted(row["retention_class"] for row in classes),
                 "negative_checks": [
+                    "approved_policy_rule_insert",
+                    "empty_policy_approval",
                     "unknown_category",
                     "mismatched_version",
                     "arbitrary_deadline",
+                    "fractional_storage_anchor",
                     "assignment_update",
                     "policy_update",
                 ],
+                "python_database_rules_equal": database_rules == python_rules,
                 "deadline_semantics": deadlines[0],
                 "valid_exact_version_assignments": 1,
                 "migration_advisory_lock_rows": 0,
