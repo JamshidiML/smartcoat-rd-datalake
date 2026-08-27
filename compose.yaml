@@ -63,6 +63,21 @@ services:
     restart: "no"
     networks: [backend]
 
+  postgres-migrate:
+    build:
+      context: ./apps/api/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:?MIGRATION_DATABASE_URL must be explicitly configured}
+    volumes:
+      - ./infra/postgres:/opt/smartcoat-postgres:ro
+    entrypoint: ["python", "/opt/smartcoat-postgres/migrate.py"]
+    command: ["apply"]
+    restart: "no"
+    networks: [backend]
+
   api:
     build:
       context: ./apps/api/src
@@ -71,6 +86,8 @@ services:
       postgres:
         condition: service_healthy
       minio-bootstrap:
+        condition: service_completed_successfully
+      postgres-migrate:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: ${DATABASE_URL}
@@ -118,6 +135,8 @@ services:
       postgres:
         condition: service_healthy
       minio-bootstrap:
+        condition: service_completed_successfully
+      postgres-migrate:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: ${DATABASE_URL}

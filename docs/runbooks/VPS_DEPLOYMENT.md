@@ -17,12 +17,45 @@ chmod 600 .env
 
 Replace every `change-me` value. Use independently generated values of at least 32 characters for PostgreSQL, MinIO, service credentials, the local password, and session secret. Then:
 
+`MIGRATION_DATABASE_URL` must be set explicitly in the protected `.env`; do not print, paste into shell history, or commit its value. Until the separately scoped M0-R02 credential work is complete, this URL must authenticate as the already configured PostgreSQL administrative/bootstrap identity: its username and password must correspond to `POSTGRES_USER` and `POSTGRES_PASSWORD` (`smartcoat_admin` in `.env.example`). Percent-encode URI-reserved characters in the URL username or password. This documents current authority only; it does not create or imply a dedicated migration role.
+
+For the first start of an unmanaged bootstrap database, start PostgreSQL by itself and wait until its existing healthcheck reports healthy:
+
 ```bash
-docker compose config
-docker compose up --build -d
-./scripts/create-pilot-users.sh
-docker compose ps
+docker compose --env-file .env config --quiet
+docker compose --env-file .env up -d postgres
+docker compose --env-file .env ps postgres
 ```
+
+Explicitly adopt only the intended database name. For the example configuration, that exact name is `smartcoat_rd`:
+
+```bash
+docker compose --env-file .env run --rm --no-deps postgres-migrate adopt smartcoat_rd
+```
+
+Adoption is never a default command, dependency action, or retry fallback. Once adoption succeeds, run the full stack normally:
+
+```bash
+docker compose --env-file .env up --build -d
+./scripts/create-pilot-users.sh
+docker compose --env-file .env ps
+```
+
+Normal startup runs only ordinary `apply`. Successful completion of the one-shot `postgres-migrate` service gates new API and OCR-worker startup. To run the same ordinary operation independently after PostgreSQL is healthy:
+
+```bash
+docker compose --env-file .env run --rm --no-deps postgres-migrate apply
+```
+
+The controls fail closed:
+
+- Missing or empty `MIGRATION_DATABASE_URL` prevents Compose configuration or migration invocation.
+- An unmanaged database makes ordinary `apply` fail; the operator must invoke the separate adoption command deliberately.
+- A bootstrap recognition mismatch rejects adoption without repair or bypass.
+- A migration failure rolls back that migration and blocks dependent new application startup.
+- Applied-history checksum, name, or ordering drift rejects ordinary migration execution.
+
+The completion gate applies when Compose creates or recreates dependent containers; a failure does not stop API or OCR-worker containers that were already running before that deployment attempt. Repeat deployment never adopts an existing volume automatically.
 
 Open `http://127.0.0.1:8080`. Confirm `docker compose ps` shows only host bindings beginning with `127.0.0.1`. Do not change them to `0.0.0.0`.
 
@@ -48,6 +81,8 @@ docker compose restart api ocr-worker
 ```
 
 Never run `docker compose down -v`; bind-mounted `.local-data` contains pilot state. Do not use MinIO root credentials for routine browsing or ingestion. Real inputs must be selected from outside the repository.
+
+The platform remains `BLOCKED`. Real company data is prohibited until M0-R05 passes; these migration operations do not change that gate.
 
 ## Handover / future migration
 

@@ -15,9 +15,10 @@ Gold data, dashboards, ML discovery, embeddings, vector databases, SmartCoat int
 ## Start locally
 
 1. Copy `.env.example` to `.env` and replace every `change-me` value.
-2. Run `docker compose up --build -d`.
-3. Run `./scripts/create-pilot-users.sh` once PostgreSQL is healthy.
-4. Open `http://127.0.0.1:8080` and sign in with the local pilot credentials.
+2. Follow [the local deployment runbook](docs/runbooks/VPS_DEPLOYMENT.md) to start PostgreSQL alone and explicitly adopt the first unmanaged bootstrap database.
+3. Run `docker compose --env-file .env up --build -d`; ordinary migration `apply` must complete before new API and OCR-worker containers start.
+4. Run `./scripts/create-pilot-users.sh` once PostgreSQL is healthy.
+5. Open `http://127.0.0.1:8080` and sign in with the local pilot credentials.
 
 MinIO is available only on `http://127.0.0.1:9000`; its local console is `http://127.0.0.1:9001`. The API is `http://127.0.0.1:8000`. See [the local deployment runbook](docs/runbooks/VPS_DEPLOYMENT.md) for bootstrap, credential rotation, backup, and troubleshooting.
 
