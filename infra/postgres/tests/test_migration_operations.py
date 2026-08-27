@@ -16,8 +16,8 @@ EXAMPLE_ENV = ROOT / ".env.example"
 MIGRATION_SERVICE = "postgres-migrate"
 
 EXPECTED_EXISTING_NETWORKS = {
-    "postgres": {"backend", "edge"},
-    "minio": {"backend", "edge"},
+    "postgres": {"backend"},
+    "minio": {"backend"},
     "minio-bootstrap": {"backend"},
     "api": {"backend", "edge"},
     "web": {"edge"},
@@ -167,7 +167,7 @@ class MigrationOperationsTests(unittest.TestCase):
                 any(name.startswith(forbidden_prefix) for name in migration_environment)
             )
 
-    def test_existing_network_memberships_and_ports_are_unchanged(self) -> None:
+    def test_network_memberships_are_segmented_and_ports_remain_loopback_only(self) -> None:
         observed_networks = {
             service_name: set(self.services[service_name].get("networks", {}))
             for service_name in EXPECTED_EXISTING_NETWORKS

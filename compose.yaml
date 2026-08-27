@@ -21,7 +21,7 @@ services:
       timeout: 30s
       retries: 20
       start_period: 20s
-    networks: [backend, edge]
+    networks: [backend]
 
   minio:
     image: minio/minio:RELEASE.2025-07-23T15-54-02Z
@@ -41,7 +41,7 @@ services:
       timeout: 30s
       retries: 20
       start_period: 20s
-    networks: [backend, edge]
+    networks: [backend]
 
   minio-bootstrap:
     image: minio/mc:RELEASE.2025-07-21T05-28-08Z
