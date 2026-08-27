@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -36,6 +36,15 @@ FAIL_PRODUCT_CONTRACT = "FAIL_PRODUCT_CONTRACT"
 PROJECT_PATTERN = re.compile(r"^m0r04-(fresh|upgraded)-[0-9a-f]{10}$")
 IMAGE_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 LABEL = "smartcoat.m0r04.project"
+CAPABILITY_SCHEMA = "m0r04_review_acceptance"
+CAPABILITY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+INTERNAL_ENVIRONMENT_KEYS = {
+    "capability": "M0R04_INTERNAL_CAPABILITY",
+    "project": "M0R04_INTERNAL_PROJECT",
+    "database": "M0R04_INTERNAL_DATABASE",
+    "app_url": "REVIEW_DATABASE_URL",
+    "admin_url": "REVIEW_ADMIN_DATABASE_URL",
+}
 
 LEGACY = {
     "ingestion_id": "00000000-0000-4000-8000-000000000401",
@@ -131,22 +140,145 @@ def assert_owned(kind: str, name: str, project: str) -> None:
         raise IsolationBlocked(f"refusing to finalize unowned {kind} resource")
 
 
+def _resource_exists(kind: str, name: str) -> bool:
+    return docker(kind, "inspect", name, check=False).returncode == 0
+
+
+def _remove_resource(kind: str, name: str) -> None:
+    if kind == "container":
+        docker("rm", "-f", name)
+    else:
+        docker(kind, "rm", name)
+
+
 def finalize(project: str, container: str, network: str, volume: str) -> None:
-    if docker("container", "inspect", container, check=False).returncode == 0:
-        assert_owned("container", container, project)
-        docker("rm", "-f", container)
-    if docker("network", "inspect", network, check=False).returncode == 0:
-        assert_owned("network", network, project)
-        docker("network", "rm", network)
-    if docker("volume", "inspect", volume, check=False).returncode == 0:
-        assert_owned("volume", volume, project)
-        docker("volume", "rm", volume)
-    if any(project_resources(project).values()):
-        raise IsolationBlocked("owned disposable resources remain after finalization")
+    """Best-effort sweep of all owned resources, including timed-out one-shots."""
+
+    failures: list[str] = []
+    try:
+        observed = project_resources(project)
+    except Exception:
+        observed = {"containers": [], "networks": [], "volumes": []}
+        failures.append("owned resource enumeration failed")
+
+    targets = {
+        "container": list(observed["containers"]),
+        "network": list(observed["networks"]),
+        "volume": list(observed["volumes"]),
+    }
+    for kind, explicit in (("container", container), ("network", network), ("volume", volume)):
+        try:
+            if _resource_exists(kind, explicit) and explicit not in targets[kind]:
+                targets[kind].append(explicit)
+        except Exception:
+            failures.append(f"{kind} existence check failed")
+
+    # Containers are removed first so a timed-out labeled one-shot cannot keep
+    # the owned internal network or volume busy.  Every later target is still
+    # attempted if inspection or removal of an earlier target fails.
+    for kind in ("container", "network", "volume"):
+        for name in targets[kind]:
+            try:
+                assert_owned(kind, name, project)
+                _remove_resource(kind, name)
+            except Exception:
+                failures.append(f"owned {kind} cleanup failed")
+
+    try:
+        remaining = project_resources(project)
+    except Exception:
+        remaining = {"containers": ["unverified"], "networks": [], "volumes": []}
+        failures.append("post-cleanup resource enumeration failed")
+    if any(remaining.values()):
+        failures.append("owned disposable resources remain after finalization")
+    if failures:
+        raise IsolationBlocked("; ".join(failures))
 
 
 def database_url(user: str, password: str, database: str) -> str:
     return f"postgresql://{quote(user)}:{quote(password)}@postgres/{quote(database)}"
+
+
+def expected_database_name(project: str) -> str:
+    if not PROJECT_PATTERN.fullmatch(project):
+        raise IsolationBlocked("internal project identity is invalid")
+    return project.replace("-", "_")
+
+
+def validate_internal_url(value: str, *, user: str, database: str) -> None:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise IsolationBlocked(
+            "internal database URL escaped the owned scenario boundary"
+        ) from exc
+    if (
+        parsed.scheme != "postgresql"
+        or parsed.hostname != "postgres"
+        or port not in (None, 5432)
+        or unquote(parsed.username or "") != user
+        or not parsed.password
+        or unquote(parsed.path.removeprefix("/")) != database
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise IsolationBlocked("internal database URL escaped the owned scenario boundary")
+
+
+def internal_identity(mode: str, environment: dict[str, str]) -> dict[str, str]:
+    try:
+        identity = {
+            name: environment[key]
+            for name, key in INTERNAL_ENVIRONMENT_KEYS.items()
+        }
+    except KeyError as exc:
+        raise IsolationBlocked("internal capability environment is incomplete") from exc
+    if not CAPABILITY_PATTERN.fullmatch(identity["capability"]):
+        raise IsolationBlocked("internal capability is invalid")
+    project = identity["project"]
+    database = identity["database"]
+    if database != expected_database_name(project):
+        raise IsolationBlocked("internal database identity does not match the owned project")
+    if mode not in {"seed-legacy", "fresh", "upgraded"}:
+        raise IsolationBlocked("internal mode is invalid")
+    validate_internal_url(identity["app_url"], user="smartcoat_app", database=database)
+    validate_internal_url(identity["admin_url"], user="r04_admin", database=database)
+    return identity
+
+
+def authenticate_internal_boundary(
+    mode: str,
+    environment: dict[str, str],
+    connector: Any,
+) -> dict[str, str]:
+    """Authenticate the controller capability before any acceptance mutation."""
+
+    identity = internal_identity(mode, environment)
+    capability_sha256 = hashlib.sha256(identity["capability"].encode()).hexdigest()
+    try:
+        with connector(identity["admin_url"]) as connection:
+            connection.execute("SET TRANSACTION READ ONLY")
+            row = connection.execute(
+                f"""
+                SELECT current_database(), current_user, count(*)
+                FROM {CAPABILITY_SCHEMA}.internal_capabilities
+                WHERE project = %s AND database_name = %s AND mode = %s
+                  AND capability_sha256 = %s
+                GROUP BY current_database(), current_user
+                """,
+                (
+                    identity["project"],
+                    identity["database"],
+                    mode,
+                    capability_sha256,
+                ),
+            ).fetchone()
+    except Exception as exc:
+        raise IsolationBlocked("internal capability could not be authenticated") from exc
+    if row != (identity["database"], "r04_admin", 1):
+        raise IsolationBlocked("internal capability did not authenticate the owned database")
+    return identity
 
 
 def one_shot(
@@ -157,7 +289,7 @@ def one_shot(
     image: str,
     environment: dict[str, str],
     command: list[str],
-    mount: str,
+    mount: str | None,
     timeout: int = 120,
 ) -> subprocess.CompletedProcess[str]:
     name = f"{project}-{suffix}"
@@ -174,7 +306,9 @@ def one_shot(
     ]
     for key, value in environment.items():
         arguments.extend(["--env", f"{key}={value}"])
-    arguments.extend(["--mount", mount, image, *command])
+    if mount is not None:
+        arguments.extend(["--mount", mount])
+    arguments.extend([image, *command])
     return docker(*arguments, check=False, timeout=timeout)
 
 
@@ -225,14 +359,84 @@ def migration_command(
         raise AcceptanceError(f"migration {action} failed with exit {result.returncode}")
 
 
+def assert_scenario_boundary(project: str, container: str, network: str) -> None:
+    assert_owned("container", container, project)
+    assert_owned("network", network, project)
+    container_networks = json.loads(
+        docker(
+            "container",
+            "inspect",
+            container,
+            "--format",
+            "{{json .NetworkSettings.Networks}}",
+        ).stdout
+    )
+    network_internal = docker(
+        "network", "inspect", network, "--format", "{{.Internal}}"
+    ).stdout.strip()
+    if set(container_networks) != {network} or network_internal != "true":
+        raise IsolationBlocked("owned PostgreSQL escaped the exact internal network boundary")
+
+
+def install_internal_capabilities(
+    *,
+    project: str,
+    container: str,
+    network: str,
+    api_image: str,
+    admin_url: str,
+    database: str,
+    capability: str,
+    modes: tuple[str, ...],
+) -> None:
+    assert_scenario_boundary(project, container, network)
+    capability_sha256 = hashlib.sha256(capability.encode()).hexdigest()
+    script = (
+        "import os, psycopg; "
+        "c=psycopg.connect(os.environ['REVIEW_ADMIN_DATABASE_URL']); "
+        "c.execute('CREATE SCHEMA m0r04_review_acceptance'); "
+        "c.execute('CREATE TABLE m0r04_review_acceptance.internal_capabilities "
+        "(project text NOT NULL, database_name text NOT NULL, mode text NOT NULL, "
+        "capability_sha256 text NOT NULL, PRIMARY KEY (project, mode))'); "
+        "c.executemany('INSERT INTO m0r04_review_acceptance.internal_capabilities "
+        "VALUES (%s,%s,%s,%s)', [(os.environ['M0R04_INTERNAL_PROJECT'], "
+        "os.environ['M0R04_INTERNAL_DATABASE'], mode, "
+        "os.environ['M0R04_INTERNAL_CAPABILITY_SHA256']) for mode in "
+        "os.environ['M0R04_INTERNAL_MODES'].split(',')]); c.commit(); c.close()"
+    )
+    result = one_shot(
+        project=project,
+        suffix="authorize-internal",
+        network=network,
+        image=api_image,
+        environment={
+            "REVIEW_ADMIN_DATABASE_URL": admin_url,
+            "M0R04_INTERNAL_PROJECT": project,
+            "M0R04_INTERNAL_DATABASE": database,
+            "M0R04_INTERNAL_CAPABILITY_SHA256": capability_sha256,
+            "M0R04_INTERNAL_MODES": ",".join(modes),
+        },
+        command=["python", "-c", script],
+        mount=None,
+    )
+    if result.returncode != 0:
+        raise AcceptanceError(
+            f"internal capability installation failed with exit {result.returncode}"
+        )
+
+
 def internal_command(
     project: str,
+    container: str,
     network: str,
     api_image: str,
     app_url: str,
     admin_url: str,
+    database: str,
+    capability: str,
     mode: str,
 ) -> dict[str, Any]:
+    assert_scenario_boundary(project, container, network)
     result = one_shot(
         project=project,
         suffix=f"verify-{mode}",
@@ -241,10 +445,14 @@ def internal_command(
         environment={
             "REVIEW_DATABASE_URL": app_url,
             "REVIEW_ADMIN_DATABASE_URL": admin_url,
+            "M0R04_INTERNAL_CAPABILITY": capability,
+            "M0R04_INTERNAL_PROJECT": project,
+            "M0R04_INTERNAL_DATABASE": database,
         },
         command=[
             "python",
             "/workspace/infra/postgres/tests/live_review_atomicity_acceptance.py",
+            CONFIRM_FLAG,
             "--internal",
             mode,
         ],
@@ -281,10 +489,11 @@ def scenario(kind: str, postgres_image: str, api_image: str) -> dict[str, Any]:
     network = f"{project}-backend"
     volume = f"{project}-postgres"
     container = f"{project}-postgres"
-    database = "smartcoat_r04"
+    database = expected_database_name(project)
     admin_user = "r04_admin"
     admin_password = secrets.token_hex(24)
     app_password = secrets.token_hex(24)
+    capability = secrets.token_hex(32)
     admin_url = database_url(admin_user, admin_password, database)
     app_url = database_url("smartcoat_app", app_password, database)
     constructed = False
@@ -324,13 +533,31 @@ def scenario(kind: str, postgres_image: str, api_image: str) -> dict[str, Any]:
         )
         wait_ready(container, admin_user, database)
         migration_command(project, network, api_image, admin_url, "adopt", database)
+        modes = ("seed-legacy", "upgraded") if kind == "upgraded" else ("fresh",)
+        install_internal_capabilities(
+            project=project,
+            container=container,
+            network=network,
+            api_image=api_image,
+            admin_url=admin_url,
+            database=database,
+            capability=capability,
+            modes=modes,
+        )
+        evidence["internal_boundary"] = {
+            "owned_project": project,
+            "database": database,
+            "capability_registered": True,
+        }
         if kind == "upgraded":
             evidence["legacy_seed"] = internal_command(
-                project, network, api_image, app_url, admin_url, "seed-legacy"
+                project, container, network, api_image, app_url, admin_url,
+                database, capability, "seed-legacy"
             )
         migration_command(project, network, api_image, admin_url, "apply", database)
         evidence["verification"] = internal_command(
-            project, network, api_image, app_url, admin_url, kind
+            project, container, network, api_image, app_url, admin_url,
+            database, capability, kind
         )
         return evidence
     finally:
@@ -344,12 +571,36 @@ def scenario(kind: str, postgres_image: str, api_image: str) -> dict[str, Any]:
 
 def catalog_contract(connection: Any) -> dict[str, Any]:
     indexes = {
-        row[0]
+        row[0]: {
+            "table": row[1],
+            "unique": bool(row[2]),
+            "valid": bool(row[3]),
+            "ready": bool(row[4]),
+            "key_columns": list(row[5]),
+            "key_count": int(row[6]),
+            "total_columns": int(row[7]),
+            "predicate": row[8],
+            "expressions": row[9],
+        }
         for row in connection.execute(
             """
-            SELECT indexname FROM pg_indexes
-            WHERE schemaname = 'public'
-              AND indexname IN (
+            SELECT index_class.relname, table_class.relname,
+                   index_meta.indisunique, index_meta.indisvalid,
+                   index_meta.indisready,
+                   ARRAY(
+                       SELECT pg_get_indexdef(index_meta.indexrelid, position, true)
+                       FROM generate_series(1, index_meta.indnkeyatts) AS position
+                       ORDER BY position
+                   ),
+                   index_meta.indnkeyatts, index_meta.indnatts,
+                   pg_get_expr(index_meta.indpred, index_meta.indrelid),
+                   pg_get_expr(index_meta.indexprs, index_meta.indrelid)
+            FROM pg_index AS index_meta
+            JOIN pg_class AS index_class ON index_class.oid = index_meta.indexrelid
+            JOIN pg_class AS table_class ON table_class.oid = index_meta.indrelid
+            JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND index_class.relname IN (
                 'review_decisions_one_per_draft_uidx',
                 'silver_verified_records_one_per_decision_uidx'
               )
@@ -357,11 +608,21 @@ def catalog_contract(connection: Any) -> dict[str, Any]:
         ).fetchall()
     }
     expected_indexes = {
-        "review_decisions_one_per_draft_uidx",
-        "silver_verified_records_one_per_decision_uidx",
+        "review_decisions_one_per_draft_uidx": {
+            "table": "review_decisions", "unique": True, "valid": True,
+            "ready": True, "key_columns": ["silver_draft_id"],
+            "key_count": 1, "total_columns": 1, "predicate": None,
+            "expressions": None,
+        },
+        "silver_verified_records_one_per_decision_uidx": {
+            "table": "silver_verified_records", "unique": True, "valid": True,
+            "ready": True, "key_columns": ["review_decision_id"],
+            "key_count": 1, "total_columns": 1, "predicate": None,
+            "expressions": None,
+        },
     }
     if indexes != expected_indexes:
-        raise AcceptanceError("M0-R04 unique-index contract is incomplete")
+        raise AcceptanceError("M0-R04 exact unique-index contract is incomplete")
     constraints = {
         row[0]: bool(row[1])
         for row in connection.execute(
@@ -382,7 +643,7 @@ def catalog_contract(connection: Any) -> dict[str, Any]:
     }
     if constraints != expected_constraints:
         raise AcceptanceError("M0-R04 request-fingerprint constraint contract is incomplete")
-    return {"unique_indexes": sorted(indexes), "constraint_validation": constraints}
+    return {"unique_indexes": indexes, "constraint_validation": constraints}
 
 
 def create_fixture(repository: Any, domain: Any, suffix: str) -> tuple[Any, dict[str, Any]]:
@@ -539,6 +800,97 @@ def assert_null_fingerprint_rejected(admin_url: str, repository: Any, domain: An
             raise AcceptanceError("rejected direct SQL review left partial evidence")
 
 
+def assert_direct_duplicates_rejected(
+    admin_url: str,
+    repository: Any,
+    domain: Any,
+) -> dict[str, Any]:
+    import psycopg
+
+    actor, draft = create_fixture(repository, domain, "direct-duplicate-guards")
+    result = domain.ReviewService(repository, True).review(
+        draft["silver_draft_id"], actor, "Temperature 23 °C",
+        "APPROVED_WITH_CORRECTIONS", "Corrected unit symbol", True
+    )
+    if result is None:
+        raise AcceptanceError("direct duplicate fixture did not create a verified record")
+    with psycopg.connect(admin_url) as connection:
+        review_decision_id = connection.execute(
+            "SELECT review_decision_id FROM review_decisions WHERE silver_draft_id = %s",
+            (draft["silver_draft_id"],),
+        ).fetchone()[0]
+
+    expected = {
+        "decision": "review_decisions_one_per_draft_uidx",
+        "verified_record": "silver_verified_records_one_per_decision_uidx",
+    }
+    observed: dict[str, str] = {}
+    try:
+        with psycopg.connect(admin_url) as connection:
+            connection.execute(
+                """
+                INSERT INTO review_decisions (
+                    review_decision_id, silver_draft_id, ingestion_id, reviewer_user_id,
+                    reviewed_at_utc, decision, explicit_confirmation, correction_summary,
+                    self_review_detected, solo_exception_applied,
+                    administrator_exception_reason, review_request_sha256
+                )
+                SELECT gen_random_uuid(), silver_draft_id, ingestion_id, reviewer_user_id,
+                       now(), decision, explicit_confirmation, correction_summary,
+                       self_review_detected, solo_exception_applied,
+                       administrator_exception_reason, repeat('d', 64)
+                FROM review_decisions WHERE silver_draft_id = %s
+                """,
+                (draft["silver_draft_id"],),
+            )
+    except psycopg.errors.UniqueViolation as exc:
+        observed["decision"] = str(exc.diag.constraint_name)
+    else:
+        raise AcceptanceError("direct SQL duplicate review decision was accepted")
+
+    try:
+        with psycopg.connect(admin_url) as connection:
+            connection.execute(
+                """
+                INSERT INTO silver_verified_records (
+                    silver_record_id, silver_revision, ingestion_id, source_sha256,
+                    status, verified_text, reviewer_user_id, reviewed_at_utc,
+                    review_decision, correction_summary, source_object_key,
+                    ocr_artifact_key, review_decision_id
+                )
+                SELECT gen_random_uuid(), silver_revision + 1, ingestion_id, source_sha256,
+                       status, verified_text, reviewer_user_id, now(), review_decision,
+                       correction_summary, source_object_key, ocr_artifact_key,
+                       review_decision_id
+                FROM silver_verified_records WHERE review_decision_id = %s
+                """,
+                (review_decision_id,),
+            )
+    except psycopg.errors.UniqueViolation as exc:
+        observed["verified_record"] = str(exc.diag.constraint_name)
+    else:
+        raise AcceptanceError("direct SQL duplicate verified record was accepted")
+
+    if observed != expected:
+        raise AcceptanceError("direct SQL duplicates hit an unexpected constraint")
+    with psycopg.connect(admin_url) as connection:
+        counts = connection.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM review_decisions WHERE silver_draft_id = %s),
+              (SELECT count(*) FROM silver_verified_records WHERE review_decision_id = %s)
+            """,
+            (draft["silver_draft_id"], review_decision_id),
+        ).fetchone()
+    if counts != (1, 1):
+        raise AcceptanceError("rejected direct SQL duplicates left partial rows")
+    return {
+        "constraint_names": observed,
+        "decision_rows": int(counts[0]),
+        "verified_record_rows": int(counts[1]),
+    }
+
+
 def seed_legacy(admin_url: str) -> dict[str, Any]:
     import psycopg
 
@@ -599,14 +951,20 @@ def seed_legacy(admin_url: str) -> dict[str, Any]:
 def internal_verify(mode: str) -> dict[str, Any]:
     import psycopg
 
+    identity = authenticate_internal_boundary(mode, dict(os.environ), psycopg.connect)
     sys.path.insert(0, "/workspace/apps/api/src")
     import domain
     from database import PostgresRepository
 
-    app_url = os.environ["REVIEW_DATABASE_URL"]
-    admin_url = os.environ["REVIEW_ADMIN_DATABASE_URL"]
+    app_url = identity["app_url"]
+    admin_url = identity["admin_url"]
+    boundary = {
+        "capability_authenticated": True,
+        "owned_project": identity["project"],
+        "database": identity["database"],
+    }
     if mode == "seed-legacy":
-        return {"status": "passed", **seed_legacy(admin_url)}
+        return {"status": "passed", "internal_boundary": boundary, **seed_legacy(admin_url)}
 
     repository = PostgresRepository(app_url)
     with psycopg.connect(admin_url) as connection:
@@ -654,6 +1012,7 @@ def internal_verify(mode: str) -> dict[str, Any]:
             raise AcceptanceError("upgraded-volume exact retry was not stable")
         return {
             "status": "passed",
+            "internal_boundary": boundary,
             "catalog": catalog,
             "legacy_preserved": True,
             "legacy_unauthenticated_replay_blocked": True,
@@ -662,6 +1021,10 @@ def internal_verify(mode: str) -> dict[str, Any]:
 
     if mode != "fresh":
         raise AcceptanceError("unsupported internal mode")
+
+    direct_duplicates = assert_direct_duplicates_rejected(
+        admin_url, repository, domain
+    )
 
     actor, draft = create_fixture(repository, domain, "fresh-exact-concurrency")
     service = domain.ReviewService(repository, True)
@@ -768,7 +1131,9 @@ def internal_verify(mode: str) -> dict[str, Any]:
         connection.execute("DROP SCHEMA IF EXISTS m0r04_faults")
     return {
         "status": "passed",
+        "internal_boundary": boundary,
         "catalog": catalog,
+        "direct_sql_duplicate_rejection": direct_duplicates,
         "concurrent_exact_callers": callers,
         "concurrent_exact_snapshot": exact_snapshot,
         "conflicting_outcomes": conflict_outcomes,
@@ -796,12 +1161,186 @@ def live() -> tuple[str, dict[str, Any]]:
     return PASS, evidence
 
 
+def _expect_exception(exception_type: type[BaseException], function: Any, message: str) -> None:
+    try:
+        function()
+    except exception_type:
+        return
+    raise AcceptanceError(message)
+
+
+def focused_regression_checks() -> dict[str, bool]:
+    """Offline checks for authorization and finalizer fail-closed predicates."""
+
+    project = "m0r04-fresh-0123456789"
+    database = expected_database_name(project)
+    capability = "a" * 64
+    environment = {
+        "M0R04_INTERNAL_CAPABILITY": capability,
+        "M0R04_INTERNAL_PROJECT": project,
+        "M0R04_INTERNAL_DATABASE": database,
+        "REVIEW_DATABASE_URL": database_url("smartcoat_app", "synthetic", database),
+        "REVIEW_ADMIN_DATABASE_URL": database_url("r04_admin", "synthetic", database),
+    }
+    connector_calls: list[str] = []
+
+    class FakeResult:
+        def __init__(self, row: Any) -> None:
+            self.row = row
+
+        def fetchone(self) -> Any:
+            return self.row
+
+    class FakeConnection:
+        def __init__(self, row: Any) -> None:
+            self.row = row
+
+        def __enter__(self) -> "FakeConnection":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def execute(self, statement: str, parameters: Any = None) -> FakeResult:
+            del parameters
+            if statement == "SET TRANSACTION READ ONLY":
+                return FakeResult(None)
+            return FakeResult(self.row)
+
+    def connector(row: Any) -> Any:
+        def connect(url: str) -> FakeConnection:
+            connector_calls.append(url)
+            return FakeConnection(row)
+
+        return connect
+
+    missing = dict(environment)
+    del missing["M0R04_INTERNAL_CAPABILITY"]
+    for mode in ("seed-legacy", "fresh", "upgraded"):
+        _expect_exception(
+            IsolationBlocked,
+            lambda selected=mode: authenticate_internal_boundary(
+                selected, missing, connector(None)
+            ),
+            f"missing internal capability did not fail closed for {mode}",
+        )
+    if connector_calls:
+        raise AcceptanceError("malformed internal authorization reached a database connector")
+
+    wrong_host = dict(environment)
+    wrong_host["REVIEW_ADMIN_DATABASE_URL"] = wrong_host[
+        "REVIEW_ADMIN_DATABASE_URL"
+    ].replace("@postgres/", "@arbitrary/", 1)
+    _expect_exception(
+        IsolationBlocked,
+        lambda: authenticate_internal_boundary("fresh", wrong_host, connector(None)),
+        "arbitrary internal database host did not fail closed",
+    )
+    if connector_calls:
+        raise AcceptanceError("out-of-bound internal URL reached a database connector")
+
+    wrong_database = dict(environment)
+    wrong_database["M0R04_INTERNAL_DATABASE"] = "arbitrary"
+    _expect_exception(
+        IsolationBlocked,
+        lambda: authenticate_internal_boundary("fresh", wrong_database, connector(None)),
+        "mismatched internal database identity did not fail closed",
+    )
+    if connector_calls:
+        raise AcceptanceError("mismatched internal identity reached a database connector")
+
+    for mode in ("seed-legacy", "fresh", "upgraded"):
+        _expect_exception(
+            IsolationBlocked,
+            lambda selected=mode: authenticate_internal_boundary(
+                selected, environment, connector(None)
+            ),
+            f"unregistered internal capability did not fail closed for {mode}",
+        )
+    expected_row = (database, "r04_admin", 1)
+    authenticated = authenticate_internal_boundary(
+        "fresh", environment, connector(expected_row)
+    )
+    if authenticated["project"] != project:
+        raise AcceptanceError("registered internal capability lost its project identity")
+
+    original_project_resources = globals()["project_resources"]
+    original_resource_exists = globals()["_resource_exists"]
+    original_assert_owned = globals()["assert_owned"]
+    original_remove_resource = globals()["_remove_resource"]
+    removals: list[tuple[str, str]] = []
+    enumerations = 0
+
+    def fake_project_resources(_: str) -> dict[str, list[str]]:
+        nonlocal enumerations
+        enumerations += 1
+        if enumerations == 1:
+            return {
+                "containers": ["owned-main", "owned-timeout-one-shot"],
+                "networks": ["owned-network"],
+                "volumes": ["owned-volume"],
+            }
+        return {"containers": [], "networks": [], "volumes": []}
+
+    def fake_remove(kind: str, name: str) -> None:
+        removals.append((kind, name))
+        if name == "owned-timeout-one-shot":
+            raise AcceptanceError("synthetic cleanup failure")
+
+    try:
+        globals()["project_resources"] = fake_project_resources
+        globals()["_resource_exists"] = lambda *_: False
+        globals()["assert_owned"] = lambda *_: None
+        globals()["_remove_resource"] = fake_remove
+        _expect_exception(
+            IsolationBlocked,
+            lambda: finalize(project, "owned-main", "owned-network", "owned-volume"),
+            "partial finalizer failure did not fail closed",
+        )
+    finally:
+        globals()["project_resources"] = original_project_resources
+        globals()["_resource_exists"] = original_resource_exists
+        globals()["assert_owned"] = original_assert_owned
+        globals()["_remove_resource"] = original_remove_resource
+    expected_removals = {
+        ("container", "owned-main"),
+        ("container", "owned-timeout-one-shot"),
+        ("network", "owned-network"),
+        ("volume", "owned-volume"),
+    }
+    if set(removals) != expected_removals:
+        raise AcceptanceError("finalizer did not attempt every owned labeled resource")
+
+    return {
+        "missing_capability_blocked_before_connect": True,
+        "all_internal_modes_require_capability": True,
+        "arbitrary_url_blocked_before_connect": True,
+        "database_identity_mismatch_blocked_before_connect": True,
+        "unregistered_capability_blocked": True,
+        "registered_capability_authenticated": True,
+        "timed_out_one_shot_enumerated": True,
+        "cleanup_attempted_after_prior_failure": True,
+        "cleanup_failure_classified_blocked_isolation": True,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(CONFIRM_FLAG, action="store_true")
     parser.add_argument("--internal", choices=("seed-legacy", "fresh", "upgraded"))
+    parser.add_argument("--run-focused-regression-checks", action="store_true")
     arguments = parser.parse_args()
+    if arguments.run_focused_regression_checks:
+        try:
+            print(json.dumps(focused_regression_checks(), sort_keys=True))
+            return 0
+        except Exception as exc:
+            print(json.dumps({"status": "failed", "classification": type(exc).__name__}, sort_keys=True))
+            return 1
     if arguments.internal:
+        if not getattr(arguments, "confirm_disposable_synthetic_review_run"):
+            print(BLOCKED_ISOLATION)
+            return 2
         try:
             print(json.dumps(internal_verify(arguments.internal), sort_keys=True))
             return 0
