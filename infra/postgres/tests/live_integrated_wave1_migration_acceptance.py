@@ -69,9 +69,10 @@ def load_suite(suite: str) -> ModuleType:
     return module
 
 
-def install_rbac_render_adapter(module: ModuleType) -> None:
-    accepted = module if module.__name__.endswith("_lifecycle") else module.accepted
+def patch_lifecycle_harness(accepted: ModuleType) -> None:
     harness_type = accepted.LiveMigrationLifecycleAcceptance
+    if getattr(harness_type, "_wave1_rbac_render_adapter", False):
+        return
     original: Callable[[Any], None] = harness_type._write_synthetic_configuration
 
     def write_integrated_configuration(harness: Any) -> None:
@@ -110,6 +111,51 @@ def install_rbac_render_adapter(module: ModuleType) -> None:
         harness.environment_file.chmod(0o600)
 
     harness_type._write_synthetic_configuration = write_integrated_configuration
+    harness_type._wave1_rbac_render_adapter = True
+
+
+def install_rbac_render_adapter(suite: str, module: ModuleType) -> None:
+    if suite == "lifecycle":
+        patch_lifecycle_harness(module)
+        return
+    if suite == "lock":
+        original = module.load_accepted_harness
+
+        def load_lock_dependency() -> ModuleType:
+            accepted = original()
+            patch_lifecycle_harness(accepted)
+            return accepted
+
+        module.load_accepted_harness = load_lock_dependency
+        return
+    if suite == "rollback":
+        original = module.load_accepted_harnesses
+
+        def load_rollback_dependencies() -> tuple[ModuleType, ModuleType]:
+            accepted, lock = original()
+            patch_lifecycle_harness(accepted)
+            return accepted, lock
+
+        module.load_accepted_harnesses = load_rollback_dependencies
+        return
+    if suite == "drift":
+        original = module.load_authenticated_live_dependencies
+
+        def load_drift_dependencies() -> tuple[Any, Any, Any]:
+            rollback, accepted, lock = original()
+            patch_lifecycle_harness(accepted)
+            return rollback, accepted, lock
+
+        module.load_authenticated_live_dependencies = load_drift_dependencies
+        return
+    original = module.load_authenticated_c2
+
+    def load_history_dependencies() -> tuple[Any, Any, Any, Any]:
+        c2, rollback, accepted, lock = original()
+        patch_lifecycle_harness(accepted)
+        return c2, rollback, accepted, lock
+
+    module.load_authenticated_c2 = load_history_dependencies
 
 
 def main() -> int:
@@ -122,7 +168,7 @@ def main() -> int:
         print(f"explicit {expected_flag} is required")
         return 2
     module = load_suite(suite)
-    install_rbac_render_adapter(module)
+    install_rbac_render_adapter(suite, module)
     sys.argv = [str(TEST_ROOT / SUITES[suite][0]), expected_flag]
     return int(module.main())
 
