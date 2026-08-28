@@ -301,53 +301,320 @@ class PostgresRepository:
                 raise KeyError(draft_id)
             return dict(row)
 
-    def create_review_decision(self, decision: dict[str, Any], verified: dict[str, Any] | None) -> None:
+    def _transition_review_state(
+        self,
+        connection: psycopg.Connection[Any],
+        ingestion_id: str,
+        previous_state: str,
+        new_state: str,
+        decision: dict[str, Any],
+    ) -> None:
+        cursor = connection.execute(
+            "UPDATE uploads SET state = %s WHERE ingestion_id = %s AND state = %s",
+            (new_state, ingestion_id, previous_state),
+        )
+        if cursor.rowcount != 1:
+            raise StateConflict(
+                f"Invalid or concurrent review transition for {ingestion_id}: "
+                f"{previous_state} -> {new_state}"
+            )
+        self._audit(
+            connection,
+            decision["reviewer_user_id"],
+            "UPLOAD",
+            ingestion_id,
+            "UPLOAD_STATE_CHANGED",
+            previous_state,
+            new_state,
+            {
+                "review_request_sha256": decision["review_request_sha256"],
+                "self_review_detected": decision["self_review_detected"],
+                "phase_1_solo_exception_applied": decision["solo_exception_applied"],
+                "exception_reason": decision["administrator_exception_reason"],
+            },
+        )
+
+    @staticmethod
+    def _verified_review_result(row: dict[str, Any]) -> dict[str, Any] | None:
+        if row["silver_record_id"] is None:
+            return None
+        return {
+            "silver_record_id": str(row["silver_record_id"]),
+            "silver_revision": int(row["silver_revision"]),
+            "ingestion_id": str(row["verified_ingestion_id"]),
+            "source_sha256": row["source_sha256"],
+            "status": row["verified_status"],
+            "verified_text": row["verified_text"],
+            "reviewer_user_id": row["verified_reviewer_user_id"],
+            "reviewed_at_utc": row["verified_reviewed_at_utc"],
+            "review_decision": row["verified_review_decision"],
+            "correction_summary": row["verified_correction_summary"],
+            "source_object_key": row["source_object_key"],
+            "ocr_artifact_key": row["ocr_artifact_key"],
+        }
+
+    def _existing_review_result(
+        self,
+        connection: psycopg.Connection[Any],
+        decision: dict[str, Any],
+        draft_status: str,
+        upload_state: str,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        row = connection.execute(
+            """
+            SELECT rd.review_decision_id, rd.review_request_sha256,
+                rd.ingestion_id AS decision_ingestion_id, rd.decision,
+                vr.silver_record_id, vr.silver_revision,
+                vr.ingestion_id AS verified_ingestion_id,
+                vr.source_sha256, vr.status AS verified_status,
+                vr.verified_text,
+                vr.reviewer_user_id AS verified_reviewer_user_id,
+                vr.reviewed_at_utc AS verified_reviewed_at_utc,
+                vr.review_decision AS verified_review_decision,
+                vr.correction_summary AS verified_correction_summary,
+                vr.source_object_key, vr.ocr_artifact_key
+            FROM review_decisions rd
+            LEFT JOIN silver_verified_records vr
+                ON vr.review_decision_id = rd.review_decision_id
+            WHERE rd.silver_draft_id = %s
+            """,
+            (decision["silver_draft_id"],),
+        ).fetchone()
+        if not row:
+            return False, None
+        if row["review_request_sha256"] != decision["review_request_sha256"]:
+            raise StateConflict("The Silver draft already has a different effective review decision")
+
+        approved = row["decision"] in {"APPROVED_NO_CHANGES", "APPROVED_WITH_CORRECTIONS"}
+        expected_final_state = "VERIFIED" if approved else "REVIEW_REJECTED"
+        if (
+            str(row["decision_ingestion_id"]) != decision["ingestion_id"]
+            or draft_status != "REVIEWED"
+            or upload_state != expected_final_state
+            or approved != (row["silver_record_id"] is not None)
+        ):
+            raise StateConflict("Stored review outcome is incomplete or internally inconsistent")
+
+        audit_counts = connection.execute(
+            """
+            SELECT
+                count(*) FILTER (
+                    WHERE entity_type = 'SILVER_DRAFT'
+                      AND entity_id = %s
+                      AND event_type = 'HUMAN_REVIEW_RECORDED'
+                      AND details_json->>'review_request_sha256' = %s
+                ) AS review_audit_count,
+                count(*) FILTER (
+                    WHERE entity_type = 'UPLOAD'
+                      AND entity_id = %s
+                      AND event_type = 'UPLOAD_STATE_CHANGED'
+                      AND new_state = %s
+                      AND details_json->>'review_request_sha256' = %s
+                ) AS final_state_audit_count
+            FROM audit_events
+            """,
+            (
+                decision["silver_draft_id"],
+                decision["review_request_sha256"],
+                decision["ingestion_id"],
+                expected_final_state,
+                decision["review_request_sha256"],
+            ),
+        ).fetchone()
+        if (
+            int(audit_counts["review_audit_count"]) != 1
+            or int(audit_counts["final_state_audit_count"]) != 1
+        ):
+            raise StateConflict("Stored review outcome is missing its unique audit evidence")
+        return True, self._verified_review_result(dict(row))
+
+    def _replay_review_after_unique_conflict(
+        self,
+        decision: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Resolve a commit-time uniqueness race without weakening conflicts.
+
+        PostgreSQL may report a uniqueness violation when two requests reached
+        the review boundary before either transaction's decision was visible.
+        The failed transaction has already rolled back at this point, so a new
+        transaction can authenticate an exact completed replay.  A different
+        request fingerprint, or an incomplete stored outcome, remains a hard
+        conflict.
+        """
         with self.connection() as connection:
-            connection.execute(
+            locked = connection.execute(
                 """
-                INSERT INTO review_decisions (
-                    review_decision_id, silver_draft_id, ingestion_id, reviewer_user_id,
-                    reviewed_at_utc, decision, explicit_confirmation, correction_summary,
-                    self_review_detected, solo_exception_applied, administrator_exception_reason
-                ) VALUES (%(review_decision_id)s, %(silver_draft_id)s, %(ingestion_id)s,
-                    %(reviewer_user_id)s, %(reviewed_at_utc)s, %(decision)s, %(explicit_confirmation)s,
-                    %(correction_summary)s, %(self_review_detected)s, %(solo_exception_applied)s,
-                    %(administrator_exception_reason)s)
+                SELECT d.status AS draft_status, u.state AS upload_state
+                FROM silver_drafts d
+                JOIN uploads u ON u.ingestion_id = d.ingestion_id
+                WHERE d.silver_draft_id = %s AND d.ingestion_id = %s
+                FOR UPDATE OF d, u
                 """,
+                (decision["silver_draft_id"], decision["ingestion_id"]),
+            ).fetchone()
+            if not locked:
+                raise StateConflict("The competing review outcome cannot be authenticated")
+            replayed, replay_result = self._existing_review_result(
+                connection,
                 decision,
+                locked["draft_status"],
+                locked["upload_state"],
             )
-            connection.execute(
-                "UPDATE silver_drafts SET status = 'REVIEWED' WHERE silver_draft_id = %s",
-                (decision["silver_draft_id"],),
-            )
-            if verified:
+            if not replayed:
+                raise StateConflict("The competing review outcome cannot be authenticated")
+            return replay_result
+
+    def complete_review(
+        self,
+        decision: dict[str, Any],
+        verified: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        try:
+            with self.connection() as connection:
+                locked = connection.execute(
+                    """
+                    SELECT d.silver_draft_id, d.ingestion_id, d.status AS draft_status,
+                        d.source_sha256, r.raw_artifact_key,
+                        u.state AS upload_state, u.stored_object_key
+                    FROM silver_drafts d
+                    JOIN uploads u ON u.ingestion_id = d.ingestion_id
+                    JOIN ocr_runs r ON r.ocr_run_id = d.ocr_run_id
+                    WHERE d.silver_draft_id = %s
+                    FOR UPDATE OF d, u
+                    """,
+                    (decision["silver_draft_id"],),
+                ).fetchone()
+                if not locked:
+                    raise KeyError(decision["silver_draft_id"])
+                if str(locked["ingestion_id"]) != decision["ingestion_id"]:
+                    raise StateConflict("Review decision does not match the locked Silver draft")
+
+                replayed, replay_result = self._existing_review_result(
+                    connection,
+                    decision,
+                    locked["draft_status"],
+                    locked["upload_state"],
+                )
+                if replayed:
+                    return replay_result
+
+                if locked["draft_status"] != "DRAFT_UNVERIFIED":
+                    raise StateConflict("Only an unverified draft can be reviewed")
+                if locked["upload_state"] not in {"SILVER_DRAFT_READY", "UNDER_HUMAN_REVIEW"}:
+                    raise StateConflict("Upload is not at a reviewable state")
+
+                approved = decision["decision"] in {
+                    "APPROVED_NO_CHANGES",
+                    "APPROVED_WITH_CORRECTIONS",
+                }
+                if approved != (verified is not None):
+                    raise StateConflict("Review decision and verified outcome do not agree")
+                if verified and (
+                    verified["ingestion_id"] != decision["ingestion_id"]
+                    or verified["source_sha256"] != locked["source_sha256"]
+                    or verified["source_object_key"] != locked["stored_object_key"]
+                    or verified["ocr_artifact_key"] != locked["raw_artifact_key"]
+                ):
+                    raise StateConflict("Verified outcome does not match the locked source evidence")
+
                 connection.execute(
                     """
-                    INSERT INTO silver_verified_records (
-                        silver_record_id, silver_revision, ingestion_id, source_sha256, status,
-                        verified_text, reviewer_user_id, reviewed_at_utc, review_decision,
-                        correction_summary, source_object_key, ocr_artifact_key, review_decision_id
-                    ) VALUES (%(silver_record_id)s, %(silver_revision)s, %(ingestion_id)s,
-                        %(source_sha256)s, %(status)s, %(verified_text)s, %(reviewer_user_id)s,
-                        %(reviewed_at_utc)s, %(review_decision)s, %(correction_summary)s,
-                        %(source_object_key)s, %(ocr_artifact_key)s, %(review_decision_id)s)
+                    INSERT INTO review_decisions (
+                        review_decision_id, silver_draft_id, ingestion_id, reviewer_user_id,
+                        reviewed_at_utc, decision, explicit_confirmation, correction_summary,
+                        self_review_detected, solo_exception_applied,
+                        administrator_exception_reason, review_request_sha256
+                    ) VALUES (%(review_decision_id)s, %(silver_draft_id)s, %(ingestion_id)s,
+                        %(reviewer_user_id)s, %(reviewed_at_utc)s, %(decision)s,
+                        %(explicit_confirmation)s, %(correction_summary)s,
+                        %(self_review_detected)s, %(solo_exception_applied)s,
+                        %(administrator_exception_reason)s, %(review_request_sha256)s)
                     """,
-                    {**verified, "review_decision_id": decision["review_decision_id"]},
+                    decision,
                 )
-            self._audit(
-                connection,
-                decision["reviewer_user_id"],
-                "SILVER_DRAFT",
-                decision["silver_draft_id"],
-                "HUMAN_REVIEW_RECORDED",
-                "DRAFT_UNVERIFIED",
-                "VERIFIED" if verified else "REVIEW_REJECTED",
-                {
-                    "decision": decision["decision"],
-                    "self_review_detected": decision["self_review_detected"],
-                    "solo_exception_applied": decision["solo_exception_applied"],
-                },
-            )
+                updated = connection.execute(
+                    """
+                    UPDATE silver_drafts SET status = 'REVIEWED'
+                    WHERE silver_draft_id = %s AND status = 'DRAFT_UNVERIFIED'
+                    """,
+                    (decision["silver_draft_id"],),
+                )
+                if updated.rowcount != 1:
+                    raise StateConflict("Silver draft review disposition changed concurrently")
+
+                verified_result = None
+                if verified:
+                    revision_row = connection.execute(
+                        """
+                        SELECT COALESCE(MAX(silver_revision), 0) + 1 AS next_revision
+                        FROM silver_verified_records
+                        WHERE ingestion_id = %s
+                        """,
+                        (decision["ingestion_id"],),
+                    ).fetchone()
+                    verified_result = {
+                        **verified,
+                        "silver_revision": int(revision_row["next_revision"]),
+                    }
+                    connection.execute(
+                        """
+                        INSERT INTO silver_verified_records (
+                            silver_record_id, silver_revision, ingestion_id, source_sha256, status,
+                            verified_text, reviewer_user_id, reviewed_at_utc, review_decision,
+                            correction_summary, source_object_key, ocr_artifact_key, review_decision_id
+                        ) VALUES (%(silver_record_id)s, %(silver_revision)s, %(ingestion_id)s,
+                            %(source_sha256)s, %(status)s, %(verified_text)s, %(reviewer_user_id)s,
+                            %(reviewed_at_utc)s, %(review_decision)s, %(correction_summary)s,
+                            %(source_object_key)s, %(ocr_artifact_key)s, %(review_decision_id)s)
+                        """,
+                        {
+                            **verified_result,
+                            "review_decision_id": decision["review_decision_id"],
+                        },
+                    )
+
+                final_state = "VERIFIED" if verified else "REVIEW_REJECTED"
+                self._audit(
+                    connection,
+                    decision["reviewer_user_id"],
+                    "SILVER_DRAFT",
+                    decision["silver_draft_id"],
+                    "HUMAN_REVIEW_RECORDED",
+                    "DRAFT_UNVERIFIED",
+                    final_state,
+                    {
+                        "decision": decision["decision"],
+                        "review_request_sha256": decision["review_request_sha256"],
+                        "self_review_detected": decision["self_review_detected"],
+                        "solo_exception_applied": decision["solo_exception_applied"],
+                    },
+                )
+
+                current_state = locked["upload_state"]
+                if current_state == "SILVER_DRAFT_READY":
+                    self._transition_review_state(
+                        connection,
+                        decision["ingestion_id"],
+                        "SILVER_DRAFT_READY",
+                        "UNDER_HUMAN_REVIEW",
+                        decision,
+                    )
+                    current_state = "UNDER_HUMAN_REVIEW"
+                self._transition_review_state(
+                    connection,
+                    decision["ingestion_id"],
+                    current_state,
+                    final_state,
+                    decision,
+                )
+                return verified_result
+        except psycopg.errors.UniqueViolation as exc:
+            try:
+                return self._replay_review_after_unique_conflict(decision)
+            except StateConflict as conflict:
+                raise StateConflict(
+                    "The Silver draft already has a different effective review outcome"
+                ) from conflict
 
     def max_silver_revision(self, ingestion_id: str) -> int:
         with self.connection() as connection:

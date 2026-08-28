@@ -58,7 +58,11 @@ class Repository(Protocol):
 
     def get_draft(self, draft_id: str) -> dict[str, Any]: ...
 
-    def create_review_decision(self, decision: dict[str, Any], verified: dict[str, Any] | None) -> None: ...
+    def complete_review(
+        self,
+        decision: dict[str, Any],
+        verified: dict[str, Any] | None,
+    ) -> dict[str, Any] | None: ...
 
     def max_silver_revision(self, ingestion_id: str) -> int: ...
 
@@ -268,7 +272,8 @@ class ReviewService:
     ) -> dict[str, Any] | None:
         draft = self.repository.get_draft(draft_id)
         upload = self.repository.get_upload(draft["ingestion_id"])
-        if draft["status"] != "DRAFT_UNVERIFIED":
+        ingestion_id = str(upload["ingestion_id"])
+        if draft["status"] not in {"DRAFT_UNVERIFIED", "REVIEWED"}:
             raise StateConflict("Only an unverified draft can be reviewed")
         if decision not in APPROVAL_DECISIONS | REJECTION_DECISIONS:
             raise ReviewValidationError("Unsupported review decision")
@@ -287,15 +292,33 @@ class ReviewService:
             elif not administrator_exception_reason:
                 raise ReviewValidationError("Self-review requires an administrator exception reason")
 
-        previous = upload["state"]
-        if previous == "SILVER_DRAFT_READY":
-            self.repository.transition(upload["ingestion_id"], previous, "UNDER_HUMAN_REVIEW", reviewer.user_id)
         review_id = uuid7()
         reviewed_at = utc_now()
+        request_payload = {
+            "contract": "smartcoat-review-operation-v1",
+            "silver_draft_id": draft_id,
+            "ingestion_id": ingestion_id,
+            "reviewer_user_id": reviewer.user_id,
+            "verified_text": verified_text,
+            "decision": decision,
+            "correction_summary": correction_summary,
+            "explicit_confirmation": explicit_confirmation,
+            "self_review_detected": self_review_detected,
+            "solo_exception_applied": solo_exception_applied,
+            "administrator_exception_reason": exception_reason,
+        }
+        review_request_sha256 = hashlib.sha256(
+            json.dumps(
+                request_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
         review = {
             "review_decision_id": review_id,
             "silver_draft_id": draft_id,
-            "ingestion_id": upload["ingestion_id"],
+            "ingestion_id": ingestion_id,
             "reviewer_user_id": reviewer.user_id,
             "reviewed_at_utc": reviewed_at,
             "decision": decision,
@@ -304,13 +327,13 @@ class ReviewService:
             "self_review_detected": self_review_detected,
             "solo_exception_applied": solo_exception_applied,
             "administrator_exception_reason": exception_reason,
+            "review_request_sha256": review_request_sha256,
         }
         verified = None
         if decision in APPROVAL_DECISIONS:
             verified = {
                 "silver_record_id": uuid7(),
-                "silver_revision": self.repository.max_silver_revision(upload["ingestion_id"]) + 1,
-                "ingestion_id": upload["ingestion_id"],
+                "ingestion_id": ingestion_id,
                 "source_sha256": upload["sha256"],
                 "status": "VERIFIED",
                 "verified_text": verified_text,
@@ -321,22 +344,7 @@ class ReviewService:
                 "source_object_key": upload["stored_object_key"],
                 "ocr_artifact_key": draft["raw_artifact_key"],
             }
-            final_state = "VERIFIED"
-        else:
-            final_state = "REVIEW_REJECTED"
-        self.repository.create_review_decision(review, verified)
-        self.repository.transition(
-            upload["ingestion_id"],
-            "UNDER_HUMAN_REVIEW",
-            final_state,
-            reviewer.user_id,
-            {
-                "self_review_detected": self_review_detected,
-                "phase_1_solo_exception_applied": solo_exception_applied,
-                "exception_reason": exception_reason,
-            },
-        )
-        return verified
+        return self.repository.complete_review(review, verified)
 
     def edit_verified(self, ingestion_id: str, actor: Actor, text: str) -> dict[str, Any]:
         upload = self.repository.get_upload(ingestion_id)

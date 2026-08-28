@@ -1174,16 +1174,17 @@ class AdoptionRunnerTests(unittest.TestCase):
         self.assertEqual(0, connection.unlocks)
 
     def test_ordinary_apply_recognizes_database_after_adoption(self) -> None:
-        baseline_only_plan = migrate.AdoptionPlan(
-            self.plan.init_sql_sha256,
-            (self.plan.baseline,),
-            self.plan.baseline,
-        )
         connection = self.unmanaged()
-        migrate.adopt_database(connection, baseline_only_plan, "smartcoat_rd")
-        result = migrate.apply_migrations(connection, baseline_only_plan.migrations)
+        migrate.adopt_database(connection, self.plan, "smartcoat_rd")
+        result = migrate.apply_migrations(
+            connection,
+            self.plan.migrations,
+        )
         self.assertEqual(1, result.already_applied)
-        self.assertEqual((), result.applied_now)
+        self.assertEqual(
+            tuple(migration.version for migration in self.plan.migrations[1:]),
+            result.applied_now,
+        )
         self.assertEqual(1, len(connection.evidence))
         self.assertEqual(2, connection.unlocks)
 
