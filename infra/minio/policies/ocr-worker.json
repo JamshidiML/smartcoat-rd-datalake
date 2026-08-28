@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": ["arn:aws:s3:::sc-rd-bronze-originals", "arn:aws:s3:::sc-rd-ocr-artifacts"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+      "Resource": ["arn:aws:s3:::sc-rd-bronze-originals/rd/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": ["arn:aws:s3:::sc-rd-ocr-artifacts/rd/*"]
+    },
+    {
+      "Effect": "Deny",
+      "Action": ["s3:GetObjectLegalHold", "s3:PutObjectLegalHold"],
+      "Resource": [
+        "arn:aws:s3:::sc-rd-bronze-originals/rd/*",
+        "arn:aws:s3:::sc-rd-bronze-manifests/rd/*",
+        "arn:aws:s3:::sc-rd-ocr-artifacts/rd/*"
+      ]
+    }
+  ]
+}

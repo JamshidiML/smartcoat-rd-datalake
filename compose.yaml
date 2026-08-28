@@ -57,10 +57,34 @@ services:
       MINIO_OCR_SECRET_KEY: ${MINIO_OCR_SECRET_KEY}
       MINIO_BACKUP_ACCESS_KEY: ${MINIO_BACKUP_ACCESS_KEY}
       MINIO_BACKUP_SECRET_KEY: ${MINIO_BACKUP_SECRET_KEY}
+      MINIO_HOLD_APPLIER_ACCESS_KEY: ${MINIO_HOLD_APPLIER_ACCESS_KEY:?MINIO_HOLD_APPLIER_ACCESS_KEY must be explicitly configured}
+      MINIO_HOLD_APPLIER_SECRET_KEY: ${MINIO_HOLD_APPLIER_SECRET_KEY:?MINIO_HOLD_APPLIER_SECRET_KEY must be explicitly configured}
     volumes:
       - ./infra/minio:/bootstrap:ro
     entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
     restart: "no"
+    networks: [backend]
+
+  legal-hold-applier:
+    build:
+      context: ./apps/legal-hold-applier/src
+    restart: unless-stopped
+    depends_on:
+      minio-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      MINIO_HOLD_APPLIER_ENDPOINT: minio:9000
+      MINIO_HOLD_APPLIER_SECURE: "false"
+      MINIO_HOLD_APPLIER_ACCESS_KEY: ${MINIO_HOLD_APPLIER_ACCESS_KEY:?MINIO_HOLD_APPLIER_ACCESS_KEY must be explicitly configured}
+      MINIO_HOLD_APPLIER_SECRET_KEY: ${MINIO_HOLD_APPLIER_SECRET_KEY:?MINIO_HOLD_APPLIER_SECRET_KEY must be explicitly configured}
+      LEGAL_HOLD_APPLIER_PORT: "8090"
+    expose: ["8090"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz')"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 5s
     networks: [backend]
 
   postgres-migrate:

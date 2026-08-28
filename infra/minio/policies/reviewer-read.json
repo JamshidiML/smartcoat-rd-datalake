@@ -18,6 +18,15 @@
         "arn:aws:s3:::sc-rd-bronze-manifests/rd/*",
         "arn:aws:s3:::sc-rd-ocr-artifacts/rd/*"
       ]
+    },
+    {
+      "Effect": "Deny",
+      "Action": ["s3:GetObjectLegalHold", "s3:PutObjectLegalHold"],
+      "Resource": [
+        "arn:aws:s3:::sc-rd-bronze-originals/rd/*",
+        "arn:aws:s3:::sc-rd-bronze-manifests/rd/*",
+        "arn:aws:s3:::sc-rd-ocr-artifacts/rd/*"
+      ]
     }
   ]
 }
