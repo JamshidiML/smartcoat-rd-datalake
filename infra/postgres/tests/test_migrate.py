@@ -1181,9 +1181,12 @@ class AdoptionRunnerTests(unittest.TestCase):
         )
         connection = self.unmanaged()
         migrate.adopt_database(connection, baseline_only_plan, "smartcoat_rd")
-        result = migrate.apply_migrations(connection, baseline_only_plan.migrations)
+        result = migrate.apply_migrations(
+            connection,
+            baseline_only_plan.migrations,
+        )
         self.assertEqual(1, result.already_applied)
-        self.assertEqual((2,), result.applied_now)
+        self.assertEqual((), result.applied_now)
         self.assertEqual(1, len(connection.evidence))
         self.assertEqual(2, connection.unlocks)
 
