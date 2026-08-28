@@ -13,6 +13,9 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[3]
 POSTGRES_ROOT = ROOT / "infra/postgres"
 MIGRATION = POSTGRES_ROOT / "migrations/0002__separate_runtime_roles.sql"
+COMPATIBILITY_MIGRATION = (
+    POSTGRES_ROOT / "migrations/0006__grant_review_audit_evidence_read.sql"
+)
 PROVISIONER = POSTGRES_ROOT / "provision_runtime_roles.py"
 LIVE_ACCEPTANCE = POSTGRES_ROOT / "tests/live_postgres_rbac_acceptance.py"
 
@@ -60,6 +63,32 @@ class RuntimeRoleContractTests(unittest.TestCase):
         self.assertNotIn(("smartcoat_ocr", "silver_drafts", "UPDATE"), privileges)
         self.assertIn(("smartcoat_review", "review_decisions", "INSERT"), privileges)
         self.assertIn(("smartcoat_review", "silver_verified_records", "INSERT"), privileges)
+
+    def test_review_retry_evidence_is_column_select_only(self) -> None:
+        self.assertEqual(
+            {
+                ("smartcoat_review", "audit_events", "entity_type"),
+                ("smartcoat_review", "audit_events", "entity_id"),
+                ("smartcoat_review", "audit_events", "event_type"),
+                ("smartcoat_review", "audit_events", "details_json"),
+                ("smartcoat_review", "audit_events", "new_state"),
+            },
+            rbac_contract.COLUMN_SELECT_PRIVILEGES,
+        )
+        self.assertNotIn(
+            ("smartcoat_review", "audit_events", "SELECT"),
+            rbac_contract.TABLE_PRIVILEGES,
+        )
+        sql = COMPATIBILITY_MIGRATION.read_text()
+        self.assertIn(
+            "GRANT SELECT (entity_type, entity_id, event_type, details_json, new_state)",
+            sql,
+        )
+        self.assertIn("ON audit_events TO smartcoat_review", sql)
+        self.assertNotRegex(
+            sql,
+            r"(?i)\b(UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP|EXECUTE|OWNERSHIP)\b",
+        )
 
     def test_backup_is_select_only_and_append_only_tables_have_no_mutation_grants(self) -> None:
         backup = {

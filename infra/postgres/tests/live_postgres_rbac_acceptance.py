@@ -39,7 +39,7 @@ OWNERSHIP_LABEL = "com.smartcoat.acceptance.r02"
 PROJECT_PATTERN = re.compile(r"^m0r02-[0-9a-f]{12}-(fresh|upgraded)$")
 IMAGE_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
-PASS = "PASS_M0_R02"
+PASS = "PASS_R02_R04_COMPATIBILITY_PROPOSAL"
 FAIL = "FAIL_M0_R02_PRODUCT_CONTRACT"
 BLOCKED_ISOLATION = "BLOCKED_M0_R02_ISOLATION"
 BLOCKED_ENVIRONMENT = "BLOCKED_M0_R02_ENVIRONMENT"
@@ -222,8 +222,9 @@ class Scenario:
             [path.name for path in discovered] == [
                 "0001__validate_bootstrap_prerequisites.sql",
                 "0002__separate_runtime_roles.sql",
+                "0006__grant_review_audit_evidence_read.sql",
             ],
-            "M0-R02 acceptance requires the exact version-1/version-2 migration plan",
+            "Compatibility acceptance requires the exact version-1/version-2/version-6 migration plan",
         )
         self.baseline_directory.mkdir(mode=0o755)
         self.full_directory.mkdir(mode=0o755)
@@ -404,8 +405,8 @@ class Scenario:
             self.checks.append("upgraded_volume_started_from_accepted_version_1")
         applied = self._migration("ordinary_apply", self.full_directory, "apply")
         require(
-            applied.returncode == 0 and "already_applied=1 applied_now=1" in applied.stdout,
-            "Migration 0002 was not applied exactly once",
+            applied.returncode == 0 and "already_applied=1 applied_now=2" in applied.stdout,
+            "Migrations 0002 and 0006 were not each applied exactly once",
         )
         if self.mode == "upgraded":
             require(
@@ -437,10 +438,15 @@ class Scenario:
             self.checks.extend(["upgraded_rows_preserved_exactly", "legacy_credential_rejected"])
         repeated = self._migration("idempotent_apply", self.full_directory, "apply")
         require(
-            repeated.returncode == 0 and "already_applied=2 applied_now=0" in repeated.stdout,
+            repeated.returncode == 0 and "already_applied=3 applied_now=0" in repeated.stdout,
             "Migration reapplication was not idempotent",
         )
-        self.checks.extend(["explicit_adoption", "migration_0002_applied_once", "migration_reapply_idempotent"])
+        self.checks.extend([
+            "explicit_adoption",
+            "migration_0002_applied_once",
+            "migration_0006_applied_once",
+            "migration_reapply_idempotent",
+        ])
 
     def provision(self) -> None:
         admin_url = (
@@ -599,6 +605,28 @@ class Scenario:
             } == rbac_contract.COLUMN_UPDATE_PRIVILEGES,
             "Catalog column grants differ from the exact M0-R02 matrix",
         )
+        select_column_privileges = self._json_value(
+            "catalog_review_audit_column_privileges",
+            self._admin_value(
+                "catalog_review_audit_column_privileges",
+                """
+                SELECT COALESCE(json_agg(row_to_json(p) ORDER BY grantee,table_name,column_name),'[]')::text
+                FROM (
+                    SELECT grantee,table_name,column_name
+                    FROM information_schema.column_privileges
+                    WHERE table_schema='public' AND table_name='audit_events'
+                      AND privilege_type='SELECT' AND grantee='smartcoat_review'
+                ) p
+                """,
+            ),
+        )
+        require(
+            {
+                (row["grantee"], row["table_name"], row["column_name"])
+                for row in select_column_privileges
+            } == rbac_contract.COLUMN_SELECT_PRIVILEGES,
+            "Catalog review audit column grants differ from the compatibility contract",
+        )
         require(
             self._admin_value(
                 "catalog_legacy_role",
@@ -617,7 +645,7 @@ class Scenario:
             self._admin_value(
                 "catalog_ledger",
                 "SELECT json_agg(version ORDER BY version)::text FROM smartcoat_migrations.applied_migrations",
-            ) == "[1, 2]",
+            ) == "[1, 2, 6]",
             "Migration ledger is not the exact accepted prefix",
         )
         require(
@@ -645,7 +673,8 @@ class Scenario:
         )
         self.checks.extend([
             "exact_role_attributes", "no_role_memberships", "exact_table_grant_matrix",
-            "exact_column_grant_matrix", "legacy_login_disabled",
+            "exact_column_grant_matrix", "exact_review_audit_column_grant_matrix",
+            "legacy_login_disabled",
             "exact_ledger_prefix", "application_append_only_triggers_preserved",
             "migration_metadata_guards_preserved",
         ])
@@ -733,6 +762,26 @@ class Scenario:
             allowed=True,
         )
         self._role_sql(
+            "positive_review_retry_audit_evidence_read",
+            "smartcoat_review",
+            """
+            SELECT
+                count(*) FILTER (
+                    WHERE entity_type='SILVER_DRAFT'
+                      AND event_type='HUMAN_REVIEW_RECORDED'
+                      AND details_json->>'review_request_sha256' IS NOT NULL
+                ),
+                count(*) FILTER (
+                    WHERE entity_type='UPLOAD'
+                      AND event_type='UPLOAD_STATE_CHANGED'
+                      AND new_state='VERIFIED'
+                      AND details_json->>'review_request_sha256' IS NOT NULL
+                )
+            FROM audit_events
+            """,
+            allowed=True,
+        )
+        self._role_sql(
             "positive_backup_reads_all_evidence",
             "smartcoat_backup",
             """
@@ -760,6 +809,9 @@ class Scenario:
             ("deny_ocr_review", "smartcoat_ocr", "INSERT INTO review_decisions DEFAULT VALUES"),
             ("deny_ocr_verified", "smartcoat_ocr", "INSERT INTO silver_verified_records DEFAULT VALUES"),
             ("deny_review_bronze", "smartcoat_review", "INSERT INTO bronze_objects DEFAULT VALUES"),
+            ("deny_review_ungranted_audit_column", "smartcoat_review", "SELECT event_id FROM audit_events"),
+            ("deny_review_audit_update", "smartcoat_review", "UPDATE audit_events SET event_type='forbidden'"),
+            ("deny_review_audit_delete", "smartcoat_review", "DELETE FROM audit_events"),
             ("deny_backup_write", "smartcoat_backup", f"UPDATE uploads SET state='REJECTED' WHERE ingestion_id='{i['upload']}'"),
         )
         for label, role, sql_text in denials:
@@ -808,7 +860,7 @@ class Scenario:
                   (SELECT count(*) FROM smartcoat_migrations.adoption_decisions)
                 )::text
                 """,
-            ) == f"[{expected_uploads}, 2, 1, 1, 1, 2, 1]",
+            ) == f"[{expected_uploads}, 2, 1, 1, 1, 3, 1]",
             "Denied SQL changed accepted synthetic state",
         )
         self.checks.extend(["append_only_direct_sql_rejected", "denials_left_state_unchanged"])

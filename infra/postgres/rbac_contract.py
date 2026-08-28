@@ -108,6 +108,17 @@ COLUMN_UPDATE_PRIVILEGES = frozenset(
     }
 )
 
+COLUMN_SELECT_PRIVILEGES = frozenset(
+    {
+        # M0-R04 authenticates an exact review retry by counting its two
+        # append-only audit facts.  The review role needs no other audit
+        # columns and retains no table-level SELECT authority.
+        *(('smartcoat_review', 'audit_events', column) for column in (
+            'entity_type', 'entity_id', 'event_type', 'details_json', 'new_state'
+        )),
+    }
+)
+
 MIGRATION_METADATA_PRIVILEGES = frozenset(
     {
         ("smartcoat_backup", "applied_migrations", "SELECT"),
