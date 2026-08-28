@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import secrets
 import stat
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -124,6 +125,33 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             self.migration_fixture_directory / TRANSITION_MIGRATION.name
         )
         self.transition_sha256 = sha256_path(TRANSITION_MIGRATION)
+        self.ingestion_password = secrets.token_hex(24)
+        self.ocr_password = secrets.token_hex(24)
+        self.review_password = secrets.token_hex(24)
+        self.backup_password = secrets.token_hex(24)
+        self.ingestion_database_url = (
+            f"postgresql://smartcoat_ingestion:{self.ingestion_password}"
+            f"@postgres:5432/{self.database_name}"
+        )
+        self.ocr_database_url = (
+            f"postgresql://smartcoat_ocr:{self.ocr_password}"
+            f"@postgres:5432/{self.database_name}"
+        )
+        self.review_database_url = (
+            f"postgresql://smartcoat_review:{self.review_password}"
+            f"@postgres:5432/{self.database_name}"
+        )
+        self.secret_values.update(
+            {
+                self.ingestion_password,
+                self.ocr_password,
+                self.review_password,
+                self.backup_password,
+                self.ingestion_database_url,
+                self.ocr_database_url,
+                self.review_database_url,
+            }
+        )
         self.evidence.update(
             {
                 "ticket": "M0-R03",
@@ -132,6 +160,21 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
                 "checks": [],
             }
         )
+
+    def _write_synthetic_configuration(self) -> None:
+        super()._write_synthetic_configuration()
+        with self.environment_file.open("a", encoding="utf-8") as environment:
+            environment.write(
+                "POSTGRES_ROLE_ADMIN_URL=" + self.migration_database_url + "\n"
+                "POSTGRES_INGESTION_PASSWORD=" + self.ingestion_password + "\n"
+                "POSTGRES_OCR_PASSWORD=" + self.ocr_password + "\n"
+                "POSTGRES_REVIEW_PASSWORD=" + self.review_password + "\n"
+                "POSTGRES_BACKUP_PASSWORD=" + self.backup_password + "\n"
+                "DATABASE_INGESTION_URL=" + self.ingestion_database_url + "\n"
+                "DATABASE_OCR_URL=" + self.ocr_database_url + "\n"
+                "DATABASE_REVIEW_URL=" + self.review_database_url + "\n"
+            )
+        self.environment_file.chmod(0o600)
 
     def _prepare_baseline_fixture(self) -> None:
         self._require(
