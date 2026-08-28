@@ -154,6 +154,132 @@ class PostgresRepository:
                 {"object_count": len(objects)},
             )
 
+    def record_retention_enforcement(
+        self,
+        assignment: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> None:
+        """Atomically append one exact-version assignment and success observation.
+
+        Storage enforcement occurs before this database boundary.  A database
+        failure never triggers storage compensation; later pair orchestration
+        owns protected-orphan discovery and retry.
+        """
+
+        with self.connection() as connection:
+            inserted_assignment = connection.execute(
+                """
+                INSERT INTO bronze_retention_assignments (
+                    retention_assignment_id, bronze_object_id, ingestion_id,
+                    bucket_name, object_key, object_kind, object_version_id,
+                    data_category, retention_class, retention_policy_version,
+                    retention_assigned_at_utc, retention_assigned_by,
+                    accepted_storage_at_utc, expected_retain_until_utc,
+                    legal_hold_required
+                ) VALUES (
+                    %(retention_assignment_id)s, %(bronze_object_id)s,
+                    %(ingestion_id)s, %(bucket_name)s, %(object_key)s,
+                    %(object_kind)s, %(object_version_id)s, %(data_category)s,
+                    %(retention_class)s, %(retention_policy_version)s,
+                    %(retention_assigned_at_utc)s, %(retention_assigned_by)s,
+                    %(accepted_storage_at_utc)s, %(expected_retain_until_utc)s,
+                    %(legal_hold_required)s
+                )
+                ON CONFLICT (bronze_object_id) DO NOTHING
+                RETURNING retention_assignment_id
+                """,
+                assignment,
+            ).fetchone()
+            if inserted_assignment is None:
+                existing_assignment = connection.execute(
+                    """
+                    SELECT retention_assignment_id::text, bronze_object_id::text,
+                        ingestion_id::text, bucket_name, object_key, object_kind,
+                        object_version_id, data_category, retention_class,
+                        retention_policy_version, retention_assigned_at_utc,
+                        retention_assigned_by, accepted_storage_at_utc,
+                        expected_retain_until_utc, legal_hold_required
+                    FROM bronze_retention_assignments
+                    WHERE bronze_object_id = %(bronze_object_id)s
+                    """,
+                    assignment,
+                ).fetchone()
+                expected_assignment = {
+                    key: assignment[key] for key in existing_assignment
+                } if existing_assignment else None
+                if existing_assignment is None or dict(existing_assignment) != expected_assignment:
+                    raise StateConflict("Conflicting exact-version retention assignment")
+
+            evidence_parameters = {
+                **evidence,
+                "enforcement_evidence_id": uuid7(),
+                "details_json": self._json(evidence.get("details_json", {})),
+            }
+            inserted_evidence = connection.execute(
+                """
+                INSERT INTO bronze_retention_enforcement_evidence (
+                    enforcement_evidence_id, retention_assignment_id,
+                    bucket_name, object_key, object_kind, object_version_id,
+                    data_category, retention_class, retention_policy_version,
+                    accepted_storage_at_utc, requested_retention_mode,
+                    requested_retain_until_utc, requested_legal_hold_status,
+                    observed_object_version_id, observed_retention_mode,
+                    observed_retain_until_utc, observed_legal_hold_status,
+                    enforcement_verified_at_utc,
+                    enforcement_verification_result, failure_code, enforced_by,
+                    details_json
+                ) VALUES (
+                    %(enforcement_evidence_id)s, %(retention_assignment_id)s,
+                    %(bucket_name)s, %(object_key)s, %(object_kind)s,
+                    %(object_version_id)s, %(data_category)s,
+                    %(retention_class)s, %(retention_policy_version)s,
+                    %(accepted_storage_at_utc)s, %(requested_retention_mode)s,
+                    %(requested_retain_until_utc)s,
+                    %(requested_legal_hold_status)s,
+                    %(observed_object_version_id)s,
+                    %(observed_retention_mode)s,
+                    %(observed_retain_until_utc)s,
+                    %(observed_legal_hold_status)s,
+                    %(enforcement_verified_at_utc)s,
+                    %(enforcement_verification_result)s, %(failure_code)s,
+                    %(enforced_by)s, %(details_json)s::jsonb
+                )
+                ON CONFLICT (
+                    retention_assignment_id, retention_policy_version
+                ) WHERE enforcement_verification_result = 'SUCCESS'
+                DO NOTHING
+                RETURNING enforcement_evidence_id
+                """,
+                evidence_parameters,
+            ).fetchone()
+            if inserted_evidence is None:
+                existing = connection.execute(
+                    """
+                    SELECT bucket_name, object_key, object_kind,
+                        object_version_id, data_category, retention_class,
+                        retention_policy_version, accepted_storage_at_utc,
+                        requested_retention_mode, requested_retain_until_utc,
+                        requested_legal_hold_status, observed_object_version_id,
+                        observed_retention_mode, observed_retain_until_utc,
+                        observed_legal_hold_status,
+                        enforcement_verification_result, failure_code,
+                        enforced_by, details_json
+                    FROM bronze_retention_enforcement_evidence
+                    WHERE retention_assignment_id = %(retention_assignment_id)s
+                      AND retention_policy_version = %(retention_policy_version)s
+                      AND enforcement_verification_result = 'SUCCESS'
+                    """,
+                    evidence_parameters,
+                ).fetchone()
+                comparable_keys = tuple(existing) if existing else ()
+                expected = {
+                    key: evidence_parameters[key] for key in comparable_keys
+                }
+                if "details_json" in expected:
+                    expected["details_json"] = evidence.get("details_json", {})
+                if existing is None or dict(existing) != expected:
+                    raise StateConflict("Conflicting retention enforcement evidence")
+
     def transition(
         self,
         ingestion_id: str,

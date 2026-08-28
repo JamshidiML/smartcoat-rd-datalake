@@ -113,12 +113,15 @@ services:
         condition: service_completed_successfully
       postgres-migrate:
         condition: service_completed_successfully
+      legal-hold-applier:
+        condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_URL}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
       MINIO_SECURE: ${MINIO_SECURE:-false}
       MINIO_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_APP_SECRET_KEY}
+      LEGAL_HOLD_APPLIER_URL: http://legal-hold-applier:8090
       LOCAL_USER_ID: ${LOCAL_USER_ID:-usr_founder}
       LOCAL_USER_DISPLAY_NAME: ${LOCAL_USER_DISPLAY_NAME:-SmartCoat Founder}
       LOCAL_USER_EMAIL: ${LOCAL_USER_EMAIL:-founder@localhost}

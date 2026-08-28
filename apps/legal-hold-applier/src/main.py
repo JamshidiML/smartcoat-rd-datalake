@@ -59,7 +59,7 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(HTTPStatus.NOT_FOUND, {"classification": "REQUEST_REJECTED"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/apply":
+        if self.path not in {"/apply", "/status"}:
             self.respond(HTTPStatus.NOT_FOUND, {"classification": "REQUEST_REJECTED"})
             return
         try:
@@ -71,9 +71,10 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.BAD_REQUEST, {"classification": "REQUEST_REJECTED"})
             return
         try:
-            CLIENT.enable_object_legal_hold(
-                target.bucket, target.object_key, version_id=target.version_id
-            )
+            if self.path == "/apply":
+                CLIENT.enable_object_legal_hold(
+                    target.bucket, target.object_key, version_id=target.version_id
+                )
             observed = CLIENT.is_object_legal_hold_enabled(
                 target.bucket, target.object_key, version_id=target.version_id
             )
@@ -83,7 +84,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"classification": "LEGAL_HOLD_APPLY_FAILED"},
             )
             return
-        if observed is not LEGAL_HOLD_ON:
+        if self.path == "/apply" and observed is not LEGAL_HOLD_ON:
             self.respond(
                 HTTPStatus.CONFLICT,
                 {"classification": "LEGAL_HOLD_READBACK_FAILED"},
@@ -92,11 +93,15 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(
             HTTPStatus.OK,
             {
-                "classification": "LEGAL_HOLD_APPLIED",
+                "classification": (
+                    "LEGAL_HOLD_APPLIED"
+                    if self.path == "/apply"
+                    else "LEGAL_HOLD_STATUS_OBSERVED"
+                ),
                 "bucket": target.bucket,
                 "object_key": target.object_key,
                 "version_id": target.version_id,
-                "legal_hold": "ON",
+                "legal_hold": "ON" if observed else "OFF",
             },
         )
 
