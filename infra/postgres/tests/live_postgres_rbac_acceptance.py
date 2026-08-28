@@ -222,15 +222,26 @@ class Scenario:
             [path.name for path in discovered] == [
                 "0001__validate_bootstrap_prerequisites.sql",
                 "0002__separate_runtime_roles.sql",
+                "0003__enforce_upload_state_transitions.sql",
+                "0004__enforce_atomic_review_decisions.sql",
+                "0005__expand_retention_metadata.sql",
                 "0006__grant_review_audit_evidence_read.sql",
             ],
-            "Compatibility acceptance requires the exact version-1/version-2/version-6 migration plan",
+            "Compatibility acceptance requires the exact integrated version-1-through-version-6 migration plan",
         )
+        focused_names = {
+            "0001__validate_bootstrap_prerequisites.sql",
+            "0002__separate_runtime_roles.sql",
+            "0006__grant_review_audit_evidence_read.sql",
+        }
+        focused_migrations = [
+            path for path in discovered if path.name in focused_names
+        ]
         self.baseline_directory.mkdir(mode=0o755)
         self.full_directory.mkdir(mode=0o755)
         for destination, sources in (
-            (self.baseline_directory, discovered[:1]),
-            (self.full_directory, discovered),
+            (self.baseline_directory, focused_migrations[:1]),
+            (self.full_directory, focused_migrations),
         ):
             for source in sources:
                 target = destination / source.name
