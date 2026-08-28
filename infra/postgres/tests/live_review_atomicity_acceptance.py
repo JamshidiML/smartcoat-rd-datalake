@@ -42,7 +42,9 @@ INTERNAL_ENVIRONMENT_KEYS = {
     "capability": "M0R04_INTERNAL_CAPABILITY",
     "project": "M0R04_INTERNAL_PROJECT",
     "database": "M0R04_INTERNAL_DATABASE",
-    "app_url": "REVIEW_DATABASE_URL",
+    "ingestion_url": "DATABASE_INGESTION_URL",
+    "ocr_url": "DATABASE_OCR_URL",
+    "review_url": "DATABASE_REVIEW_URL",
     "admin_url": "REVIEW_ADMIN_DATABASE_URL",
 }
 
@@ -269,7 +271,17 @@ def internal_identity(mode: str, environment: dict[str, str]) -> dict[str, str]:
         raise IsolationBlocked("internal database identity does not match the owned project")
     if mode not in {"seed-legacy", "fresh", "upgraded"}:
         raise IsolationBlocked("internal mode is invalid")
-    validate_internal_url(identity["app_url"], user="smartcoat_app", database=database)
+    if mode == "seed-legacy":
+        for key in ("ingestion_url", "ocr_url", "review_url"):
+            validate_internal_url(identity[key], user="smartcoat_app", database=database)
+    else:
+        validate_internal_url(
+            identity["ingestion_url"], user="smartcoat_ingestion", database=database
+        )
+        validate_internal_url(identity["ocr_url"], user="smartcoat_ocr", database=database)
+        validate_internal_url(
+            identity["review_url"], user="smartcoat_review", database=database
+        )
     validate_internal_url(identity["admin_url"], user="r04_admin", database=database)
     return identity
 
@@ -493,7 +505,9 @@ def internal_command(
     container: str,
     network: str,
     api_image: str,
-    app_url: str,
+    ingestion_url: str,
+    ocr_url: str,
+    review_url: str,
     admin_url: str,
     database: str,
     capability: str,
@@ -506,7 +520,9 @@ def internal_command(
         network=network,
         image=api_image,
         environment={
-            "REVIEW_DATABASE_URL": app_url,
+            "DATABASE_INGESTION_URL": ingestion_url,
+            "DATABASE_OCR_URL": ocr_url,
+            "DATABASE_REVIEW_URL": review_url,
             "REVIEW_ADMIN_DATABASE_URL": admin_url,
             "M0R04_INTERNAL_CAPABILITY": capability,
             "M0R04_INTERNAL_PROJECT": project,
@@ -545,6 +561,28 @@ def internal_command(
     return value
 
 
+def provision_runtime_roles(
+    project: str,
+    network: str,
+    api_image: str,
+    admin_url: str,
+    passwords: dict[str, str],
+) -> None:
+    result = one_shot(
+        project=project,
+        suffix="provision-runtime-roles",
+        network=network,
+        image=api_image,
+        environment={"POSTGRES_ROLE_ADMIN_URL": admin_url, **passwords},
+        command=["python", "/workspace/infra/postgres/provision_runtime_roles.py"],
+        mount=f"type=bind,src={ROOT},dst=/workspace,readonly",
+    )
+    if result.returncode != 0:
+        raise AcceptanceError(
+            f"runtime-role provisioning failed with exit {result.returncode}"
+        )
+
+
 def scenario(kind: str, postgres_image: str, api_image: str) -> dict[str, Any]:
     project = f"m0r04-{kind}-{secrets.token_hex(5)}"
     if not PROJECT_PATTERN.fullmatch(project):
@@ -555,10 +593,25 @@ def scenario(kind: str, postgres_image: str, api_image: str) -> dict[str, Any]:
     database = expected_database_name(project)
     admin_user = "r04_admin"
     admin_password = secrets.token_hex(24)
-    app_password = secrets.token_hex(24)
+    legacy_app_password = secrets.token_hex(24)
+    runtime_passwords = {
+        "POSTGRES_INGESTION_PASSWORD": secrets.token_hex(24),
+        "POSTGRES_OCR_PASSWORD": secrets.token_hex(24),
+        "POSTGRES_REVIEW_PASSWORD": secrets.token_hex(24),
+        "POSTGRES_BACKUP_PASSWORD": secrets.token_hex(24),
+    }
     capability = secrets.token_hex(32)
     admin_url = database_url(admin_user, admin_password, database)
-    app_url = database_url("smartcoat_app", app_password, database)
+    legacy_app_url = database_url("smartcoat_app", legacy_app_password, database)
+    ingestion_url = database_url(
+        "smartcoat_ingestion", runtime_passwords["POSTGRES_INGESTION_PASSWORD"], database
+    )
+    ocr_url = database_url(
+        "smartcoat_ocr", runtime_passwords["POSTGRES_OCR_PASSWORD"], database
+    )
+    review_url = database_url(
+        "smartcoat_review", runtime_passwords["POSTGRES_REVIEW_PASSWORD"], database
+    )
     constructed = False
     evidence: dict[str, Any] = {"scenario": kind, "project": project}
     try:
@@ -584,7 +637,7 @@ def scenario(kind: str, postgres_image: str, api_image: str) -> dict[str, Any]:
             "--env",
             f"POSTGRES_PASSWORD={admin_password}",
             "--env",
-            f"POSTGRES_APP_PASSWORD={app_password}",
+            f"POSTGRES_APP_PASSWORD={legacy_app_password}",
             "--mount",
             f"type=volume,src={volume},dst=/var/lib/postgresql/data",
             "--mount",
@@ -614,12 +667,17 @@ def scenario(kind: str, postgres_image: str, api_image: str) -> dict[str, Any]:
         }
         if kind == "upgraded":
             evidence["legacy_seed"] = internal_command(
-                project, container, network, api_image, app_url, admin_url,
+                project, container, network, api_image,
+                legacy_app_url, legacy_app_url, legacy_app_url, admin_url,
                 database, capability, "seed-legacy"
             )
         migration_command(project, network, api_image, admin_url, "apply", database)
+        provision_runtime_roles(
+            project, network, api_image, admin_url, runtime_passwords
+        )
         evidence["verification"] = internal_command(
-            project, container, network, api_image, app_url, admin_url,
+            project, container, network, api_image,
+            ingestion_url, ocr_url, review_url, admin_url,
             database, capability, kind
         )
         return evidence
@@ -709,7 +767,12 @@ def catalog_contract(connection: Any) -> dict[str, Any]:
     return {"unique_indexes": indexes, "constraint_validation": constraints}
 
 
-def create_fixture(repository: Any, domain: Any, suffix: str) -> tuple[Any, dict[str, Any]]:
+def create_fixture(
+    ingestion_repository: Any,
+    ocr_repository: Any,
+    domain: Any,
+    suffix: str,
+) -> tuple[Any, dict[str, Any]]:
     class SyntheticStorage:
         def __init__(self) -> None:
             self.objects: dict[tuple[str, str], bytes] = {}
@@ -723,9 +786,13 @@ def create_fixture(repository: Any, domain: Any, suffix: str) -> tuple[Any, dict
             return self.objects[(bucket, key)]
 
     actor = domain.Actor("usr_m0r04", "M0-R04 Synthetic Reviewer")
-    repository.ensure_local_user(actor.user_id, actor.display_name, "m0r04@localhost")
+    ingestion_repository.ensure_local_user(
+        actor.user_id, actor.display_name, "m0r04@localhost"
+    )
     source = b"\xff\xd8\xff\xe0" + f"m0-r04-{suffix}".encode() + b"\xff\xd9"
-    upload = domain.IngestionService(repository, SyntheticStorage(), 1024 * 1024).ingest(
+    upload = domain.IngestionService(
+        ingestion_repository, SyntheticStorage(), 1024 * 1024
+    ).ingest(
         actor,
         f"m0-r04-{suffix}.jpg",
         source,
@@ -733,7 +800,7 @@ def create_fixture(repository: Any, domain: Any, suffix: str) -> tuple[Any, dict
         f"Synthetic M0-R04 {suffix} fixture only.",
         None,
     )
-    ocr = domain.OCRDomainService(repository)
+    ocr = domain.OCRDomainService(ocr_repository)
     run_id = ocr.start(upload["ingestion_id"], "paddleocr", "3.7.0", {"fixture": suffix})
     draft = ocr.complete(
         upload["ingestion_id"],
@@ -829,10 +896,18 @@ def remove_fault(connection: Any, checkpoint: str, table: str) -> None:
     )
 
 
-def assert_null_fingerprint_rejected(admin_url: str, repository: Any, domain: Any, suffix: str) -> None:
+def assert_null_fingerprint_rejected(
+    admin_url: str,
+    ingestion_repository: Any,
+    ocr_repository: Any,
+    domain: Any,
+    suffix: str,
+) -> None:
     import psycopg
 
-    actor, draft = create_fixture(repository, domain, suffix)
+    actor, draft = create_fixture(
+        ingestion_repository, ocr_repository, domain, suffix
+    )
     try:
         with psycopg.connect(admin_url) as connection:
             connection.execute(
@@ -865,13 +940,17 @@ def assert_null_fingerprint_rejected(admin_url: str, repository: Any, domain: An
 
 def assert_direct_duplicates_rejected(
     admin_url: str,
-    repository: Any,
+    ingestion_repository: Any,
+    ocr_repository: Any,
+    review_repository: Any,
     domain: Any,
 ) -> dict[str, Any]:
     import psycopg
 
-    actor, draft = create_fixture(repository, domain, "direct-duplicate-guards")
-    result = domain.ReviewService(repository, True).review(
+    actor, draft = create_fixture(
+        ingestion_repository, ocr_repository, domain, "direct-duplicate-guards"
+    )
+    result = domain.ReviewService(review_repository, True).review(
         draft["silver_draft_id"], actor, "Temperature 23 °C",
         "APPROVED_WITH_CORRECTIONS", "Corrected unit symbol", True
     )
@@ -1019,7 +1098,6 @@ def internal_verify(mode: str) -> dict[str, Any]:
     import domain
     from database import PostgresRepository
 
-    app_url = identity["app_url"]
     admin_url = identity["admin_url"]
     boundary = {
         "capability_authenticated": True,
@@ -1029,10 +1107,18 @@ def internal_verify(mode: str) -> dict[str, Any]:
     if mode == "seed-legacy":
         return {"status": "passed", "internal_boundary": boundary, **seed_legacy(admin_url)}
 
-    repository = PostgresRepository(app_url)
+    ingestion_repository = PostgresRepository(identity["ingestion_url"])
+    ocr_repository = PostgresRepository(identity["ocr_url"])
+    review_repository = PostgresRepository(identity["review_url"])
     with psycopg.connect(admin_url) as connection:
         catalog = catalog_contract(connection)
-    assert_null_fingerprint_rejected(admin_url, repository, domain, f"{mode}-null")
+    assert_null_fingerprint_rejected(
+        admin_url,
+        ingestion_repository,
+        ocr_repository,
+        domain,
+        f"{mode}-null",
+    )
 
     if mode == "upgraded":
         with psycopg.connect(admin_url) as connection:
@@ -1053,7 +1139,7 @@ def internal_verify(mode: str) -> dict[str, Any]:
             raise AcceptanceError("valid pre-M0-R04 review history changed during upgrade")
         actor = domain.Actor("usr_m0r04_legacy", "Legacy Synthetic Reviewer")
         try:
-            domain.ReviewService(repository, True).review(
+            domain.ReviewService(review_repository, True).review(
                 LEGACY["draft_id"], actor, "legacy synthetic text",
                 "APPROVED_NO_CHANGES", "", True
             )
@@ -1061,8 +1147,10 @@ def internal_verify(mode: str) -> dict[str, Any]:
             pass
         else:
             raise AcceptanceError("legacy row without an authenticated fingerprint replayed")
-        actor, draft = create_fixture(repository, domain, "upgraded-production")
-        service = domain.ReviewService(repository, True)
+        actor, draft = create_fixture(
+            ingestion_repository, ocr_repository, domain, "upgraded-production"
+        )
+        service = domain.ReviewService(review_repository, True)
         first = service.review(
             draft["silver_draft_id"], actor, "Temperature 23 °C",
             "APPROVED_WITH_CORRECTIONS", "Corrected unit symbol", True
@@ -1086,11 +1174,17 @@ def internal_verify(mode: str) -> dict[str, Any]:
         raise AcceptanceError("unsupported internal mode")
 
     direct_duplicates = assert_direct_duplicates_rejected(
-        admin_url, repository, domain
+        admin_url,
+        ingestion_repository,
+        ocr_repository,
+        review_repository,
+        domain,
     )
 
-    actor, draft = create_fixture(repository, domain, "fresh-exact-concurrency")
-    service = domain.ReviewService(repository, True)
+    actor, draft = create_fixture(
+        ingestion_repository, ocr_repository, domain, "fresh-exact-concurrency"
+    )
+    service = domain.ReviewService(review_repository, True)
     callers = 8
     barrier = Barrier(callers)
 
@@ -1116,8 +1210,10 @@ def internal_verify(mode: str) -> dict[str, Any]:
     }:
         raise AcceptanceError("concurrent exact retry evidence was not exactly once")
 
-    conflict_actor, conflict_draft = create_fixture(repository, domain, "fresh-conflict")
-    conflict_service = domain.ReviewService(repository, True)
+    conflict_actor, conflict_draft = create_fixture(
+        ingestion_repository, ocr_repository, domain, "fresh-conflict"
+    )
+    conflict_service = domain.ReviewService(review_repository, True)
     conflict_barrier = Barrier(2)
 
     def approve() -> str:
@@ -1158,7 +1254,12 @@ def internal_verify(mode: str) -> dict[str, Any]:
     for checkpoint in (
         "decision", "draft", "verified", "review_audit", "enter_review", "final_state"
     ):
-        fault_actor, fault_draft = create_fixture(repository, domain, f"fault-{checkpoint}")
+        fault_actor, fault_draft = create_fixture(
+            ingestion_repository,
+            ocr_repository,
+            domain,
+            f"fault-{checkpoint}",
+        )
         with psycopg.connect(admin_url) as connection:
             before = review_snapshot(
                 connection, fault_draft["silver_draft_id"], fault_draft["ingestion_id"]
@@ -1167,7 +1268,7 @@ def internal_verify(mode: str) -> dict[str, Any]:
                 connection, checkpoint, fault_draft["silver_draft_id"], fault_draft["ingestion_id"]
             )
         try:
-            domain.ReviewService(repository, True).review(
+            domain.ReviewService(review_repository, True).review(
                 fault_draft["silver_draft_id"], fault_actor, "Temperature 23 °C",
                 "APPROVED_WITH_CORRECTIONS", "Corrected unit symbol", True
             )
@@ -1183,7 +1284,7 @@ def internal_verify(mode: str) -> dict[str, Any]:
             if after != before:
                 raise AcceptanceError(f"partial review evidence survived fault at {checkpoint}")
             remove_fault(connection, checkpoint, table)
-        recovered = domain.ReviewService(repository, True).review(
+        recovered = domain.ReviewService(review_repository, True).review(
             fault_draft["silver_draft_id"], fault_actor, "Temperature 23 °C",
             "APPROVED_WITH_CORRECTIONS", "Corrected unit symbol", True
         )
@@ -1242,7 +1343,13 @@ def focused_regression_checks() -> dict[str, bool]:
         "M0R04_INTERNAL_CAPABILITY": capability,
         "M0R04_INTERNAL_PROJECT": project,
         "M0R04_INTERNAL_DATABASE": database,
-        "REVIEW_DATABASE_URL": database_url("smartcoat_app", "synthetic", database),
+        "DATABASE_INGESTION_URL": database_url(
+            "smartcoat_ingestion", "synthetic", database
+        ),
+        "DATABASE_OCR_URL": database_url("smartcoat_ocr", "synthetic", database),
+        "DATABASE_REVIEW_URL": database_url(
+            "smartcoat_review", "synthetic", database
+        ),
         "REVIEW_ADMIN_DATABASE_URL": database_url("r04_admin", "synthetic", database),
     }
     connector_calls: list[str] = []
