@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 
 from rbac_contract import (
     ADMIN_DATABASE_ENV,
+    COLUMN_SELECT_PRIVILEGES,
     COLUMN_UPDATE_PRIVILEGES,
     LEGACY_SHARED_ROLE,
     MIGRATION_METADATA_PRIVILEGES,
@@ -170,6 +171,22 @@ def validate_installed_contract(connection: Any) -> None:
     ).fetchall()
     if frozenset(tuple(row) for row in column_rows) != COLUMN_UPDATE_PRIVILEGES:
         raise ProvisioningError("Column-update grants do not match the M0-R02 contract")
+
+    select_column_rows = connection.execute(
+        """
+        SELECT grantee, table_name, column_name
+        FROM information_schema.column_privileges
+        WHERE table_schema = 'public'
+          AND table_name = 'audit_events'
+          AND privilege_type = 'SELECT'
+          AND grantee = 'smartcoat_review'
+        ORDER BY grantee, table_name, column_name
+        """
+    ).fetchall()
+    if frozenset(tuple(row) for row in select_column_rows) != COLUMN_SELECT_PRIVILEGES:
+        raise ProvisioningError(
+            "Column-select grants do not match the review retry-evidence contract"
+        )
 
     metadata_rows = connection.execute(
         """
