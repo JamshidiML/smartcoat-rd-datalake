@@ -18,12 +18,12 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 CONTROL = ROOT / "infra" / "minio"
-APPLIER = ROOT / "apps" / "legal-hold-applier" / "src"
 SERVER_REF = "minio/minio:RELEASE.2025-07-23T15-54-02Z"
 MC_REF = "minio/mc:RELEASE.2025-07-21T05-28-08Z"
 SDK_REF = "smartcoat-rd-datalake-api:latest"
 CONFIRM_FLAG = "--confirm-disposable-synthetic-legal-hold-mediation-run"
-PASS = "PASS_LEGAL_HOLD_AUTHORITY_READY"
+APPLIER_IMAGE_FLAG = "--legal-hold-applier-image"
+PASS = "PASS_LEGAL_HOLD_AUTHORITY_READY_PRODUCTION_IMAGE"
 FAIL = "FAIL_LEGAL_HOLD_AUTHORITY_READY"
 LABEL = "smartcoat.legal-hold-mediation.project"
 PROJECT = re.compile(r"^m0hold-[0-9a-f]{12}$")
@@ -76,6 +76,29 @@ def image_id(reference: str) -> str:
     if result.returncode != 0 or not IMAGE_ID.fullmatch(value):
         raise EnvironmentBlocked(f"required local image is unavailable: {reference}")
     return value
+
+
+def production_image_contract(reference: str) -> dict[str, Any]:
+    inspected = docker("image", "inspect", reference, check=False)
+    if inspected.returncode != 0:
+        raise EnvironmentBlocked("production legal-hold image is unavailable")
+    values = json.loads(inspected.stdout)
+    if not isinstance(values, list) or len(values) != 1:
+        raise AcceptanceFailure("production legal-hold image identity is ambiguous")
+    config = values[0].get("Config", {})
+    version = docker(
+        "run", "--rm", "--pull=never", "--entrypoint", "python", reference,
+        "-c", "import minio; print(minio.__version__)",
+    ).stdout.strip()
+    if version != "7.2.16":
+        raise AcceptanceFailure("production legal-hold image SDK version is not pinned")
+    return {
+        "sdk_version": version,
+        "entrypoint": config.get("Entrypoint"),
+        "command": config.get("Cmd"),
+        "user": config.get("User"),
+        "working_directory": config.get("WorkingDir"),
+    }
 
 
 def inventory() -> dict[str, list[str]]:
@@ -267,7 +290,7 @@ print('ON' if enabled else 'OFF')
     raise AcceptanceFailure("exact-version legal-hold status was not recognized")
 
 
-def live() -> tuple[str, dict[str, Any]]:
+def live(applier_reference: str) -> tuple[str, dict[str, Any]]:
     project = f"m0hold-{secrets.token_hex(6)}"
     if not PROJECT.fullmatch(project):
         raise AcceptanceFailure("generated project identity is invalid")
@@ -281,7 +304,9 @@ def live() -> tuple[str, dict[str, Any]]:
         "server": image_id(SERVER_REF),
         "mc": image_id(MC_REF),
         "sdk": image_id(SDK_REF),
+        "applier": image_id(applier_reference),
     }
+    applier_contract = production_image_contract(images["applier"])
     root = {"ROOT_USER": f"root{secrets.token_hex(8)}", "ROOT_PASSWORD": secrets.token_hex(24)}
     identities = {
         name: {"ACCESS_KEY": f"{name}{secrets.token_hex(6)}", "SECRET_KEY": secrets.token_hex(24)}
@@ -292,6 +317,7 @@ def live() -> tuple[str, dict[str, Any]]:
     evidence: dict[str, Any] = {
         "project": project,
         "images": images,
+        "production_image_contract": applier_contract,
         "initial_inventory": inventory_evidence(initial),
     }
     try:
@@ -399,12 +425,10 @@ print(json.dumps({'versions': versions}, sort_keys=True))
             "--label", f"{LABEL}={project}", "--network", backend,
             "--network-alias", "legal-hold-applier", "--read-only",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
-            "--mount", f"type=bind,src={APPLIER},dst=/app,readonly",
-            "--workdir", "/app",
         ]
         for key in mediator_environment:
             mediator_run.extend(["--env", key])
-        mediator_run.extend(["--entrypoint", "python", images["sdk"], "main.py"])
+        mediator_run.append(images["applier"])
         run(mediator_run, environment=mediator_environment)
 
         context_names: list[str] = []
@@ -639,12 +663,17 @@ mc rm --force --version-id "$VERSION_ID" local/sc-rd-bronze-originals/rd/synthet
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(CONFIRM_FLAG, action="store_true")
+    parser.add_argument(APPLIER_IMAGE_FLAG)
     args = parser.parse_args()
     if not getattr(args, CONFIRM_FLAG[2:].replace("-", "_")):
         print(f"{FAIL}: explicit {CONFIRM_FLAG} is required")
         return 2
+    applier_reference = getattr(args, APPLIER_IMAGE_FLAG[2:].replace("-", "_"))
+    if not applier_reference or not IMAGE_ID.fullmatch(applier_reference):
+        print(f"{FAIL}: explicit immutable {APPLIER_IMAGE_FLAG} is required")
+        return 2
     try:
-        classification, evidence = live()
+        classification, evidence = live(applier_reference)
     except AcceptanceFailure as exc:
         print(json.dumps({"classification": FAIL, "reason": str(exc)}, sort_keys=True))
         return 1
