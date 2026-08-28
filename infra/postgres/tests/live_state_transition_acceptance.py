@@ -129,6 +129,8 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
         self.ocr_password = secrets.token_hex(24)
         self.review_password = secrets.token_hex(24)
         self.backup_password = secrets.token_hex(24)
+        self.hold_applier_access_key = f"m0r03-hold-{secrets.token_hex(8)}"
+        self.hold_applier_secret_key = secrets.token_hex(24)
         self.ingestion_database_url = (
             f"postgresql://smartcoat_ingestion:{self.ingestion_password}"
             f"@postgres:5432/{self.database_name}"
@@ -150,6 +152,8 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
                 self.ingestion_database_url,
                 self.ocr_database_url,
                 self.review_database_url,
+                self.hold_applier_access_key,
+                self.hold_applier_secret_key,
             }
         )
         self.evidence.update(
@@ -173,6 +177,12 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
                 "DATABASE_INGESTION_URL=" + self.ingestion_database_url + "\n"
                 "DATABASE_OCR_URL=" + self.ocr_database_url + "\n"
                 "DATABASE_REVIEW_URL=" + self.review_database_url + "\n"
+                "MINIO_HOLD_APPLIER_ACCESS_KEY="
+                + self.hold_applier_access_key
+                + "\n"
+                "MINIO_HOLD_APPLIER_SECRET_KEY="
+                + self.hold_applier_secret_key
+                + "\n"
             )
         self.environment_file.chmod(0o600)
 
