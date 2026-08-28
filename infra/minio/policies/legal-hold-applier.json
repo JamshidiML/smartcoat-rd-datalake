@@ -3,7 +3,7 @@
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Action": ["s3:GetBucketLocation"],
       "Resource": [
         "arn:aws:s3:::sc-rd-bronze-originals",
         "arn:aws:s3:::sc-rd-bronze-manifests"
@@ -11,7 +11,7 @@
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:PutObjectRetention"],
+      "Action": ["s3:GetObjectLegalHold", "s3:PutObjectLegalHold"],
       "Resource": [
         "arn:aws:s3:::sc-rd-bronze-originals/rd/*",
         "arn:aws:s3:::sc-rd-bronze-manifests/rd/*"
@@ -19,7 +19,12 @@
     },
     {
       "Effect": "Deny",
-      "Action": ["s3:GetObjectLegalHold", "s3:PutObjectLegalHold"],
+      "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:PutObjectRetention",
+        "s3:BypassGovernanceRetention"
+      ],
       "Resource": [
         "arn:aws:s3:::sc-rd-bronze-originals/rd/*",
         "arn:aws:s3:::sc-rd-bronze-manifests/rd/*"
