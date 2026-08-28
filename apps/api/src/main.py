@@ -19,6 +19,7 @@ from validation import UploadValidationError
 
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+REVIEW_DATABASE_URL = os.environ["REVIEW_DATABASE_URL"]
 LOCAL_USER_ID = os.getenv("LOCAL_USER_ID", "usr_founder")
 LOCAL_USER_DISPLAY_NAME = os.getenv("LOCAL_USER_DISPLAY_NAME", "SmartCoat Founder")
 LOCAL_USER_EMAIL = os.getenv("LOCAL_USER_EMAIL", "founder@localhost")
@@ -29,6 +30,7 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 ALLOW_SOLO_REVIEW = os.getenv("ALLOW_PHASE_1_SOLO_SELF_REVIEW", "true").lower() == "true"
 
 repository = PostgresRepository(DATABASE_URL)
+review_repository = PostgresRepository(REVIEW_DATABASE_URL)
 minio_client = Minio(
     os.getenv("MINIO_ENDPOINT", "minio:9000"),
     access_key=os.environ["MINIO_ACCESS_KEY"],
@@ -37,7 +39,7 @@ minio_client = Minio(
 )
 storage = MinioObjectStorage(minio_client)
 ingestion_service = IngestionService(repository, storage, MAX_UPLOAD_BYTES)
-review_service = ReviewService(repository, ALLOW_SOLO_REVIEW)
+review_service = ReviewService(review_repository, ALLOW_SOLO_REVIEW)
 
 
 @asynccontextmanager
@@ -105,6 +107,8 @@ def health() -> dict[str, str]:
 @app.get("/readyz")
 def readiness() -> dict[str, str]:
     with repository.connection() as connection:
+        connection.execute("SELECT 1")
+    with review_repository.connection() as connection:
         connection.execute("SELECT 1")
     if not minio_client.bucket_exists("sc-rd-bronze-manifests"):
         raise HTTPException(status_code=503, detail="Bronze manifest bucket unavailable")

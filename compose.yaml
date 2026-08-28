@@ -78,6 +78,26 @@ services:
     restart: "no"
     networks: [backend]
 
+  postgres-role-provision:
+    build:
+      context: ./apps/api/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-migrate:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_ROLE_ADMIN_URL: ${POSTGRES_ROLE_ADMIN_URL:?POSTGRES_ROLE_ADMIN_URL must be explicitly configured}
+      POSTGRES_INGESTION_PASSWORD: ${POSTGRES_INGESTION_PASSWORD:?POSTGRES_INGESTION_PASSWORD must be explicitly configured}
+      POSTGRES_OCR_PASSWORD: ${POSTGRES_OCR_PASSWORD:?POSTGRES_OCR_PASSWORD must be explicitly configured}
+      POSTGRES_REVIEW_PASSWORD: ${POSTGRES_REVIEW_PASSWORD:?POSTGRES_REVIEW_PASSWORD must be explicitly configured}
+      POSTGRES_BACKUP_PASSWORD: ${POSTGRES_BACKUP_PASSWORD:?POSTGRES_BACKUP_PASSWORD must be explicitly configured}
+    volumes:
+      - ./infra/postgres:/opt/smartcoat-postgres:ro
+    entrypoint: ["python", "/opt/smartcoat-postgres/provision_runtime_roles.py"]
+    restart: "no"
+    networks: [backend]
+
   api:
     build:
       context: ./apps/api/src
@@ -89,8 +109,11 @@ services:
         condition: service_completed_successfully
       postgres-migrate:
         condition: service_completed_successfully
+      postgres-role-provision:
+        condition: service_completed_successfully
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_INGESTION_URL:?DATABASE_INGESTION_URL must be explicitly configured}
+      REVIEW_DATABASE_URL: ${DATABASE_REVIEW_URL:?DATABASE_REVIEW_URL must be explicitly configured}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
       MINIO_SECURE: ${MINIO_SECURE:-false}
       MINIO_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY}
@@ -138,8 +161,10 @@ services:
         condition: service_completed_successfully
       postgres-migrate:
         condition: service_completed_successfully
+      postgres-role-provision:
+        condition: service_completed_successfully
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_OCR_URL:?DATABASE_OCR_URL must be explicitly configured}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
       MINIO_SECURE: ${MINIO_SECURE:-false}
       MINIO_ACCESS_KEY: ${MINIO_OCR_ACCESS_KEY}

@@ -23,9 +23,9 @@ if [ "${1:-}" = "backup" ]; then
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   destination="$backup_root/$timestamp"
   mkdir -p "$destination/minio-data"
-  docker compose exec -T -e PGPASSWORD="$POSTGRES_APP_PASSWORD" postgres pg_dump \
+  docker compose exec -T -e PGPASSWORD="$POSTGRES_BACKUP_PASSWORD" postgres pg_dump \
     --format=custom --no-owner --no-privileges \
-    -h 127.0.0.1 -U "$POSTGRES_APP_USER" -d "$POSTGRES_DB" > "$destination/postgres.dump"
+    -h 127.0.0.1 -U smartcoat_backup -d "$POSTGRES_DB" > "$destination/postgres.dump"
   cp -a "$minio_source/." "$destination/minio-data/"
   (cd "$destination" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS)
   ln -sfn "$destination" "$backup_root/latest"
