@@ -33,8 +33,9 @@ class RetentionMetadataMigrationTests(unittest.TestCase):
         import migrate
 
         discovered = migrate.discover_migrations(ROOT / "infra/postgres/migrations")
-        self.assertEqual([1, 5], [item.version for item in discovered])
-        self.assertEqual("expand_retention_metadata", discovered[-1].name)
+        self.assertEqual([1, 2, 3, 4, 5, 6], [item.version for item in discovered])
+        by_version = {item.version: item for item in discovered}
+        self.assertEqual("expand_retention_metadata", by_version[5].name)
 
     def test_schema_declares_exact_canonical_classes(self) -> None:
         expected = set(self.policy.CANONICAL_RETENTION_CLASSES)
