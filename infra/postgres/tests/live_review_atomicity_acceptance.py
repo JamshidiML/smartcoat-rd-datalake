@@ -151,6 +151,34 @@ def _remove_resource(kind: str, name: str) -> None:
         docker(kind, "rm", name)
 
 
+def _remove_owned_resource(kind: str, name: str, project: str) -> None:
+    """Remove one owned target while tolerating Docker auto-remove races."""
+
+    for attempt in range(4):
+        if not _resource_exists(kind, name):
+            return
+        try:
+            assert_owned(kind, name, project)
+        except Exception:
+            if not _resource_exists(kind, name):
+                return
+            raise
+        try:
+            _remove_resource(kind, name)
+        except Exception:
+            if not _resource_exists(kind, name):
+                return
+            if attempt == 3:
+                raise
+            time.sleep(0.25)
+            continue
+        if not _resource_exists(kind, name):
+            return
+        if attempt != 3:
+            time.sleep(0.25)
+    raise IsolationBlocked(f"owned {kind} resource survived cleanup")
+
+
 def finalize(project: str, container: str, network: str, volume: str) -> None:
     """Best-effort sweep of all owned resources, including timed-out one-shots."""
 
@@ -179,8 +207,7 @@ def finalize(project: str, container: str, network: str, volume: str) -> None:
     for kind in ("container", "network", "volume"):
         for name in targets[kind]:
             try:
-                assert_owned(kind, name, project)
-                _remove_resource(kind, name)
+                _remove_owned_resource(kind, name, project)
             except Exception:
                 failures.append(f"owned {kind} cleanup failed")
 
@@ -391,19 +418,44 @@ def install_internal_capabilities(
 ) -> None:
     assert_scenario_boundary(project, container, network)
     capability_sha256 = hashlib.sha256(capability.encode()).hexdigest()
-    script = (
-        "import os, psycopg; "
-        "c=psycopg.connect(os.environ['REVIEW_ADMIN_DATABASE_URL']); "
-        "c.execute('CREATE SCHEMA m0r04_review_acceptance'); "
-        "c.execute('CREATE TABLE m0r04_review_acceptance.internal_capabilities "
-        "(project text NOT NULL, database_name text NOT NULL, mode text NOT NULL, "
-        "capability_sha256 text NOT NULL, PRIMARY KEY (project, mode))'); "
-        "c.executemany('INSERT INTO m0r04_review_acceptance.internal_capabilities "
-        "VALUES (%s,%s,%s,%s)', [(os.environ['M0R04_INTERNAL_PROJECT'], "
-        "os.environ['M0R04_INTERNAL_DATABASE'], mode, "
-        "os.environ['M0R04_INTERNAL_CAPABILITY_SHA256']) for mode in "
-        "os.environ['M0R04_INTERNAL_MODES'].split(',')]); c.commit(); c.close()"
-    )
+    script = """
+import json
+import os
+
+try:
+    import psycopg
+
+    connection = psycopg.connect(os.environ["REVIEW_ADMIN_DATABASE_URL"])
+    with connection.cursor() as cursor:
+        cursor.execute("CREATE SCHEMA m0r04_review_acceptance")
+        cursor.execute(
+            "CREATE TABLE m0r04_review_acceptance.internal_capabilities "
+            "(project text NOT NULL, database_name text NOT NULL, mode text NOT NULL, "
+            "capability_sha256 text NOT NULL, PRIMARY KEY (project, mode))"
+        )
+        cursor.executemany(
+            "INSERT INTO m0r04_review_acceptance.internal_capabilities "
+            "VALUES (%s,%s,%s,%s)",
+            [
+                (
+                    os.environ["M0R04_INTERNAL_PROJECT"],
+                    os.environ["M0R04_INTERNAL_DATABASE"],
+                    mode,
+                    os.environ["M0R04_INTERNAL_CAPABILITY_SHA256"],
+                )
+                for mode in os.environ["M0R04_INTERNAL_MODES"].split(",")
+            ],
+        )
+    connection.commit()
+    connection.close()
+except Exception as exc:
+    print(json.dumps({
+        "classification": "SANITIZED_CAPABILITY_INSTALL_FAILURE",
+        "exception_type": type(exc).__name__,
+        "sqlstate": getattr(exc, "sqlstate", None),
+    }, sort_keys=True))
+    raise SystemExit(1)
+"""
     result = one_shot(
         project=project,
         suffix="authorize-internal",
@@ -420,8 +472,19 @@ def install_internal_capabilities(
         mount=None,
     )
     if result.returncode != 0:
+        diagnostic = "unparseable_sanitized_diagnostic"
+        try:
+            value = json.loads(result.stdout)
+            if value.get("classification") == "SANITIZED_CAPABILITY_INSTALL_FAILURE":
+                diagnostic = (
+                    f"{value.get('exception_type', 'unknown')}:"
+                    f"{value.get('sqlstate') or 'no_sqlstate'}"
+                )
+        except (json.JSONDecodeError, AttributeError):
+            pass
         raise AcceptanceError(
-            f"internal capability installation failed with exit {result.returncode}"
+            "internal capability installation failed with "
+            f"exit {result.returncode}: {diagnostic}"
         )
 
 
@@ -1287,11 +1350,22 @@ def focused_regression_checks() -> dict[str, bool]:
         if name == "owned-timeout-one-shot":
             raise AcceptanceError("synthetic cleanup failure")
 
+    persistent_resources = {
+        "owned-main", "owned-timeout-one-shot", "owned-network", "owned-volume"
+    }
+
+    def fake_resource_exists(_kind: str, name: str) -> bool:
+        return name in persistent_resources
+
     try:
         globals()["project_resources"] = fake_project_resources
-        globals()["_resource_exists"] = lambda *_: False
+        globals()["_resource_exists"] = fake_resource_exists
         globals()["assert_owned"] = lambda *_: None
-        globals()["_remove_resource"] = fake_remove
+        globals()["_remove_resource"] = (
+            lambda kind, name: (
+                fake_remove(kind, name), persistent_resources.discard(name)
+            )
+        )
         _expect_exception(
             IsolationBlocked,
             lambda: finalize(project, "owned-main", "owned-network", "owned-volume"),
@@ -1311,6 +1385,44 @@ def focused_regression_checks() -> dict[str, bool]:
     if set(removals) != expected_removals:
         raise AcceptanceError("finalizer did not attempt every owned labeled resource")
 
+    vanished_checks = 0
+
+    def vanished_exists(_kind: str, _name: str) -> bool:
+        nonlocal vanished_checks
+        vanished_checks += 1
+        return False
+
+    vanished_enumerations = 0
+
+    def vanished_project_resources(_: str) -> dict[str, list[str]]:
+        nonlocal vanished_enumerations
+        vanished_enumerations += 1
+        if vanished_enumerations == 1:
+            return {
+                "containers": ["already-auto-removed"],
+                "networks": [],
+                "volumes": [],
+            }
+        return {"containers": [], "networks": [], "volumes": []}
+
+    try:
+        globals()["project_resources"] = vanished_project_resources
+        globals()["_resource_exists"] = vanished_exists
+        globals()["assert_owned"] = lambda *_: (_ for _ in ()).throw(
+            AcceptanceError("ownership inspection must not run for a vanished target")
+        )
+        globals()["_remove_resource"] = lambda *_: (_ for _ in ()).throw(
+            AcceptanceError("removal must not run for a vanished target")
+        )
+        finalize(project, "already-auto-removed", "absent-network", "absent-volume")
+    finally:
+        globals()["project_resources"] = original_project_resources
+        globals()["_resource_exists"] = original_resource_exists
+        globals()["assert_owned"] = original_assert_owned
+        globals()["_remove_resource"] = original_remove_resource
+    if vanished_checks == 0:
+        raise AcceptanceError("vanished auto-remove target was not checked")
+
     return {
         "missing_capability_blocked_before_connect": True,
         "all_internal_modes_require_capability": True,
@@ -1321,6 +1433,7 @@ def focused_regression_checks() -> dict[str, bool]:
         "timed_out_one_shot_enumerated": True,
         "cleanup_attempted_after_prior_failure": True,
         "cleanup_failure_classified_blocked_isolation": True,
+        "vanished_auto_remove_target_tolerated": True,
     }
 
 
