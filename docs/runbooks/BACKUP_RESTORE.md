@@ -2,7 +2,7 @@
 
 ## Backup
 
-`scripts/restore-drill.sh backup` creates a timestamped directory under `~/SmartCoatRDLakeBackups` by default. It writes a PostgreSQL custom-format dump using the non-superuser application identity, copies the entire MinIO data directory, creates per-file SHA-256 checksums, applies owner-only permissions via `umask 077`, and moves the `latest` symlink.
+`scripts/restore-drill.sh backup` creates a timestamped directory under `~/SmartCoatRDLakeBackups` by default. It writes a PostgreSQL custom-format dump using the read-only `smartcoat_backup` identity, copies the entire MinIO data directory, creates per-file SHA-256 checksums, applies owner-only permissions via `umask 077`, and moves the `latest` symlink.
 
 ```bash
 ./scripts/restore-drill.sh backup

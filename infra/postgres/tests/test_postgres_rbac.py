@@ -1,0 +1,250 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+
+ROOT = Path(__file__).resolve().parents[3]
+POSTGRES_ROOT = ROOT / "infra/postgres"
+MIGRATION = POSTGRES_ROOT / "migrations/0002__separate_runtime_roles.sql"
+PROVISIONER = POSTGRES_ROOT / "provision_runtime_roles.py"
+LIVE_ACCEPTANCE = POSTGRES_ROOT / "tests/live_postgres_rbac_acceptance.py"
+
+sys.path.insert(0, str(POSTGRES_ROOT))
+import rbac_contract  # noqa: E402
+
+spec = importlib.util.spec_from_file_location("provision_runtime_roles", PROVISIONER)
+if spec is None or spec.loader is None:  # pragma: no cover - import boundary
+    raise RuntimeError("Could not load PostgreSQL role provisioner")
+provision_runtime_roles = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(provision_runtime_roles)
+
+
+def example_environment() -> dict[str, str]:
+    return {
+        name: value
+        for line in (ROOT / ".env.example").read_text().splitlines()
+        if line and not line.startswith("#") and "=" in line
+        for name, value in (line.split("=", 1),)
+    }
+
+
+class RuntimeRoleContractTests(unittest.TestCase):
+    def test_four_workflow_roles_are_distinct_non_admin_logins(self) -> None:
+        self.assertEqual(
+            {
+                "smartcoat_ingestion",
+                "smartcoat_ocr",
+                "smartcoat_review",
+                "smartcoat_backup",
+            },
+            set(rbac_contract.ROLE_NAMES),
+        )
+        self.assertEqual(4, len(rbac_contract.expected_role_attributes()))
+        for row in rbac_contract.expected_role_attributes():
+            self.assertEqual((False, True, False, False, True, False, False), row[1:])
+
+    def test_cross_boundary_writes_are_absent_from_contract(self) -> None:
+        privileges = rbac_contract.TABLE_PRIVILEGES
+        for role in ("smartcoat_ingestion", "smartcoat_ocr"):
+            for table in ("review_decisions", "silver_verified_records"):
+                self.assertNotIn((role, table, "INSERT"), privileges)
+        self.assertNotIn(("smartcoat_ingestion", "silver_drafts", "INSERT"), privileges)
+        self.assertIn(("smartcoat_ocr", "silver_drafts", "INSERT"), privileges)
+        self.assertNotIn(("smartcoat_ocr", "silver_drafts", "UPDATE"), privileges)
+        self.assertIn(("smartcoat_review", "review_decisions", "INSERT"), privileges)
+        self.assertIn(("smartcoat_review", "silver_verified_records", "INSERT"), privileges)
+
+    def test_backup_is_select_only_and_append_only_tables_have_no_mutation_grants(self) -> None:
+        backup = {
+            item for item in rbac_contract.TABLE_PRIVILEGES if item[0] == "smartcoat_backup"
+        }
+        self.assertEqual(
+            {
+                ("smartcoat_backup", table, "SELECT")
+                for table in rbac_contract.PUBLIC_TABLES
+            },
+            backup,
+        )
+        self.assertFalse(
+            any(item[0] == "smartcoat_backup" for item in rbac_contract.COLUMN_UPDATE_PRIVILEGES)
+        )
+        for role in rbac_contract.ROLE_NAMES:
+            for table in rbac_contract.PROTECTED_APPEND_ONLY_TABLES:
+                self.assertNotIn((role, table, "UPDATE"), rbac_contract.TABLE_PRIVILEGES)
+                self.assertNotIn((role, table, "DELETE"), rbac_contract.TABLE_PRIVILEGES)
+
+    def test_migration_is_password_free_and_disables_legacy_shared_login(self) -> None:
+        sql = MIGRATION.read_text()
+        self.assertIn("ALTER ROLE smartcoat_app NOLOGIN PASSWORD NULL", sql)
+        self.assertNotIn("change-me", sql)
+        for role in rbac_contract.ROLE_NAMES:
+            self.assertIn(role, sql)
+        for environment_name in (
+            rbac_contract.ADMIN_DATABASE_ENV,
+            *(role.password_environment for role in rbac_contract.RUNTIME_ROLES.values()),
+        ):
+            self.assertNotIn(environment_name, sql)
+        self.assertIn("REVOKE EXECUTE ON FUNCTION public.reject_immutable_mutation()", sql)
+
+    def test_existing_four_append_only_triggers_remain_authoritative(self) -> None:
+        init_sql = (POSTGRES_ROOT / "init.sql").read_text()
+        for trigger in (
+            "bronze_objects_append_only",
+            "verified_records_append_only",
+            "review_decisions_append_only",
+            "audit_events_append_only",
+        ):
+            self.assertIn(f"CREATE TRIGGER {trigger}", init_sql)
+        self.assertNotRegex(MIGRATION.read_text(), r"(?i)DROP\s+TRIGGER|DISABLE\s+TRIGGER")
+
+
+class CredentialProvisioningBoundaryTests(unittest.TestCase):
+    def test_admin_url_is_explicit_and_database_url_is_not_a_fallback(self) -> None:
+        with self.assertRaises(provision_runtime_roles.ProvisioningError):
+            provision_runtime_roles.admin_database_url(
+                {"DATABASE_URL": "postgresql://ordinary-runtime"}
+            )
+        self.assertEqual(
+            "postgresql://explicit-admin",
+            provision_runtime_roles.admin_database_url(
+                {rbac_contract.ADMIN_DATABASE_ENV: "postgresql://explicit-admin"}
+            ),
+        )
+
+    def test_passwords_are_required_long_and_distinct(self) -> None:
+        environment = {
+            role.password_environment: f"{workflow}-" + ("x" * 40)
+            for workflow, role in rbac_contract.RUNTIME_ROLES.items()
+        }
+        values = rbac_contract.password_values(environment)
+        self.assertEqual(set(rbac_contract.ROLE_NAMES), set(values))
+
+        missing = dict(environment)
+        missing.pop(rbac_contract.RUNTIME_ROLES["ocr"].password_environment)
+        with self.assertRaises(ValueError):
+            rbac_contract.password_values(missing)
+
+        duplicate = dict(environment)
+        duplicate[rbac_contract.RUNTIME_ROLES["ocr"].password_environment] = duplicate[
+            rbac_contract.RUNTIME_ROLES["ingestion"].password_environment
+        ]
+        with self.assertRaises(ValueError):
+            rbac_contract.password_values(duplicate)
+
+        provision_runtime_roles.validate_admin_password_separation(
+            "postgresql://admin:distinct-admin-password@postgres:5432/smartcoat_rd",
+            values,
+        )
+        reused = dict(values)
+        reused["smartcoat_ocr"] = "same-admin-password"
+        with self.assertRaises(provision_runtime_roles.ProvisioningError):
+            provision_runtime_roles.validate_admin_password_separation(
+                "postgresql://admin:same-admin-password@postgres:5432/smartcoat_rd",
+                reused,
+            )
+
+    def test_live_acceptance_is_explicitly_opt_in(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(LIVE_ACCEPTANCE)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(2, completed.returncode)
+        self.assertIn("BLOCKED_M0_R02_ISOLATION", completed.stdout)
+        self.assertIn("--confirm-disposable-synthetic-rbac-run", completed.stdout)
+
+
+class ComposeCredentialBoundaryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        environment = os.environ.copy()
+        environment.pop("COMPOSE_FILE", None)
+        rendered = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                str(ROOT / ".env.example"),
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if rendered.returncode != 0:
+            raise AssertionError((rendered.stderr or rendered.stdout).strip())
+        cls.services = json.loads(rendered.stdout)["services"]
+        cls.environment = example_environment()
+
+    def test_runtime_urls_name_distinct_expected_identities(self) -> None:
+        expected = {
+            "DATABASE_INGESTION_URL": "smartcoat_ingestion",
+            "DATABASE_OCR_URL": "smartcoat_ocr",
+            "DATABASE_REVIEW_URL": "smartcoat_review",
+            "DATABASE_BACKUP_URL": "smartcoat_backup",
+        }
+        self.assertNotIn("DATABASE_URL", self.environment)
+        observed_passwords: set[str] = set()
+        for name, username in expected.items():
+            parsed = urlsplit(self.environment[name])
+            self.assertEqual(username, unquote(parsed.username or ""))
+            observed_passwords.add(unquote(parsed.password or ""))
+        self.assertEqual(4, len(observed_passwords))
+
+    def test_api_and_ocr_receive_only_their_workflow_database_urls(self) -> None:
+        api = self.services["api"]["environment"]
+        worker = self.services["ocr-worker"]["environment"]
+        self.assertEqual(self.environment["DATABASE_INGESTION_URL"], api["DATABASE_URL"])
+        self.assertEqual(self.environment["DATABASE_REVIEW_URL"], api["REVIEW_DATABASE_URL"])
+        self.assertEqual(self.environment["DATABASE_OCR_URL"], worker["DATABASE_URL"])
+        for runtime in (api, worker):
+            self.assertNotIn("MIGRATION_DATABASE_URL", runtime)
+            self.assertNotIn("POSTGRES_ROLE_ADMIN_URL", runtime)
+
+    def test_provisioner_is_backend_only_one_shot_and_admin_is_not_runtime(self) -> None:
+        service = self.services["postgres-role-provision"]
+        self.assertEqual("no", service["restart"])
+        self.assertEqual({"backend"}, set(service["networks"]))
+        self.assertNotIn("ports", service)
+        self.assertEqual(
+            {
+                "POSTGRES_ROLE_ADMIN_URL",
+                "POSTGRES_INGESTION_PASSWORD",
+                "POSTGRES_OCR_PASSWORD",
+                "POSTGRES_REVIEW_PASSWORD",
+                "POSTGRES_BACKUP_PASSWORD",
+            },
+            set(service["environment"]),
+        )
+        for runtime_name in ("api", "ocr-worker"):
+            dependency = self.services[runtime_name]["depends_on"]["postgres-role-provision"]
+            self.assertEqual("service_completed_successfully", dependency["condition"])
+
+    def test_application_wiring_and_backup_use_narrow_identities(self) -> None:
+        main = (ROOT / "apps/api/src/main.py").read_text()
+        worker = (ROOT / "apps/ocr-worker/src/jobs/worker.py").read_text()
+        restore = (ROOT / "scripts/restore-drill.sh").read_text()
+        self.assertIn('REVIEW_DATABASE_URL = os.environ["REVIEW_DATABASE_URL"]', main)
+        self.assertIn("ReviewService(review_repository", main)
+        self.assertIn("with review_repository.connection() as connection:", main)
+        self.assertIn('PostgresRepository(os.environ["DATABASE_URL"])', worker)
+        self.assertIn('PGPASSWORD="$POSTGRES_BACKUP_PASSWORD"', restore)
+        self.assertIn("-U smartcoat_backup", restore)
+        self.assertNotIn("POSTGRES_APP_PASSWORD", restore)
+
+
+if __name__ == "__main__":
+    unittest.main()

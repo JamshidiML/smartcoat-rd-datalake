@@ -1178,7 +1178,7 @@ class AdoptionRunnerTests(unittest.TestCase):
         migrate.adopt_database(connection, self.plan, "smartcoat_rd")
         result = migrate.apply_migrations(connection, self.plan.migrations)
         self.assertEqual(1, result.already_applied)
-        self.assertEqual((), result.applied_now)
+        self.assertEqual((2,), result.applied_now)
         self.assertEqual(1, len(connection.evidence))
         self.assertEqual(2, connection.unlocks)
 

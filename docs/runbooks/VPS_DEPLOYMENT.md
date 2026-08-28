@@ -17,7 +17,7 @@ chmod 600 .env
 
 Replace every `change-me` value. Use independently generated values of at least 32 characters for PostgreSQL, MinIO, service credentials, the local password, and session secret. Then:
 
-`MIGRATION_DATABASE_URL` must be set explicitly in the protected `.env`; do not print, paste into shell history, or commit its value. Until the separately scoped M0-R02 credential work is complete, this URL must authenticate as the already configured PostgreSQL administrative/bootstrap identity: its username and password must correspond to `POSTGRES_USER` and `POSTGRES_PASSWORD` (`smartcoat_admin` in `.env.example`). Percent-encode URI-reserved characters in the URL username or password. This documents current authority only; it does not create or imply a dedicated migration role.
+M0-R02 separates PostgreSQL workflow authority. `MIGRATION_DATABASE_URL` and `POSTGRES_ROLE_ADMIN_URL` must be set explicitly in the protected `.env`; do not print, paste into shell history, or commit their values. Both one-shot operations currently authenticate as the configured PostgreSQL administrative/bootstrap identity: their username and password correspond to `POSTGRES_USER` and `POSTGRES_PASSWORD` (`smartcoat_admin` in `.env.example`). `MIGRATION_DATABASE_URL` is consumed only by the migration runner. `POSTGRES_ROLE_ADMIN_URL` is consumed only by the credential provisioner after migration 0002 has installed and validated the fixed runtime-role contract. Percent-encode URI-reserved characters in URL usernames or passwords.
 
 For the first start of an unmanaged bootstrap database, start PostgreSQL by itself and wait until its existing healthcheck reports healthy:
 
@@ -41,7 +41,7 @@ docker compose --env-file .env up --build -d
 docker compose --env-file .env ps
 ```
 
-Normal startup runs only ordinary `apply`. Successful completion of the one-shot `postgres-migrate` service gates new API and OCR-worker startup. To run the same ordinary operation independently after PostgreSQL is healthy:
+Normal startup runs ordinary `apply`, then the backend-only `postgres-role-provision` one-shot operation. Successful completion of both gates new API and OCR-worker startup. To run the same ordinary migration operation independently after PostgreSQL is healthy:
 
 ```bash
 docker compose --env-file .env run --rm --no-deps postgres-migrate apply
@@ -65,11 +65,17 @@ If a default host port is already occupied, change only the corresponding `HOST_
 
 MinIO root credentials are consumed only by the one-shot bootstrap container. API, worker, and backup use their separate identities. To rotate a service credential, stop its consumer, change the secret through the MinIO console on localhost, update `.env`, recreate the consumer, and test its narrow operation. Record the date and operator below.
 
+PostgreSQL runtime authority is split across fixed identities: `smartcoat_ingestion` serves upload/Bronze/queue and API reads, `smartcoat_ocr` may create only OCR evidence and unverified drafts, `smartcoat_review` owns review and verified-record writes, and `smartcoat_backup` is read-only. The historical `smartcoat_app` role is bootstrap compatibility only and migration 0002 disables its login and revokes its authority. The API receives separate ingestion and review URLs; the OCR worker receives only its OCR URL; the backup script receives only the backup password. Runtime services never receive either administrative URL. To rotate PostgreSQL runtime passwords, stop the affected consumers, replace the four distinct password and URL values in `.env`, run `docker compose --env-file .env run --rm --no-deps postgres-role-provision`, recreate the consumers, and exercise both an allowed operation and a cross-boundary denial.
+
 | Identity | Last rotation (UTC) | Operator |
 | --- | --- | --- |
 | `app-ingestion` |  |  |
 | `ocr-worker` |  |  |
 | `backup` |  |  |
+| `postgres-ingestion` |  |  |
+| `postgres-ocr` |  |  |
+| `postgres-review` |  |  |
+| `postgres-backup` |  |  |
 
 ## Operations
 
