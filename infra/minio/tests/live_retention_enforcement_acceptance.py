@@ -179,9 +179,19 @@ if variant in {'mediator_failure', 'interrupted_execution'}:
     mediator = 'http://127.0.0.1:1'
 client = Minio('minio:9000', access_key=os.environ['ACCESS_KEY'],
                secret_key=os.environ['SECRET_KEY'], secure=False)
+class ForbiddenMediator:
+    def apply_on(self, target):
+        raise RuntimeError('MEDIATOR_MUST_NOT_BE_REACHED')
+    def read_status(self, target):
+        raise RuntimeError('MEDIATOR_MUST_NOT_BE_REACHED')
+hold_mediator = (
+    ForbiddenMediator()
+    if variant == 'retention_api_denial'
+    else HttpLegalHoldMediator(mediator, os.environ['CALL_TOKEN'], 0.5)
+)
 service = ExactVersionRetentionEnforcer(
     MinioExactVersionRetentionStorage(client),
-    HttpLegalHoldMediator(mediator, os.environ['CALL_TOKEN'], 0.5))
+    hold_mediator)
 try:
     service.enforce(
         target=ExactVersionTarget(bucket, key, version, item['object_kind']),
@@ -454,6 +464,7 @@ mc admin policy attach local legal-hold-applier --user "$MEDIATOR_ACCESS_KEY" >/
             "malformed_version", "missing_version", "unknown_policy",
             "mediator_failure", "interrupted_execution",
         ):
+            stage = f"run_fail_closed_negative:{variant}"
             result = run_python(
                 project, backend, retention_image, NEGATIVE_PROGRAM,
                 {
@@ -466,12 +477,14 @@ mc admin policy attach local legal-hold-applier --user "$MEDIATOR_ACCESS_KEY" >/
             if not isinstance(result, dict) or not result.get("failed_closed"):
                 raise legal.AcceptanceFailure(f"negative {variant} did not fail closed")
             negative_results[variant] = result
+        stage = "run_fail_closed_negative:retention_api_denial_target"
         denial_target = run_python(
             project, backend, retention_image,
             RETENTION_DENIAL_TARGET_PROGRAM, root,
         )
         if not isinstance(denial_target, dict):
             raise legal.AcceptanceFailure("retention API denial target is invalid")
+        stage = "run_fail_closed_negative:retention_api_denial"
         denied_result = run_python(
             project, backend, retention_image, NEGATIVE_PROGRAM,
             {
@@ -483,6 +496,7 @@ mc admin policy attach local legal-hold-applier --user "$MEDIATOR_ACCESS_KEY" >/
         if not isinstance(denied_result, dict) or not denied_result.get("failed_closed"):
             raise legal.AcceptanceFailure("retention API denial did not fail closed")
         negative_results["retention_api_denial"] = denied_result
+        stage = "run_fail_closed_negative:readback_mismatch"
         mismatch = run_python(
             project, backend, retention_image, READBACK_MISMATCH_PROGRAM,
             {**app, "CALL_TOKEN": call_token, "TARGET": json.dumps(permanent)},

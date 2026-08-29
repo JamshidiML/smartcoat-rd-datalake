@@ -97,6 +97,14 @@ class RetentionEnforcementMigrationTests(unittest.TestCase):
         self.assertFalse(any("smartcoat_review" in value for value in grants))
         self.assertNotRegex(self.sql, r"(?i)GRANT\s+[^;]*(UPDATE|DELETE|TRUNCATE|CREATE|ALL)")
 
+    def test_identity_guards_do_not_require_update_class_row_locks(self) -> None:
+        self.assertIn(
+            "CREATE OR REPLACE FUNCTION validate_bronze_retention_assignment()",
+            self.sql,
+        )
+        self.assertNotIn("FOR KEY SHARE", self.sql)
+        self.assertNotIn("SECURITY DEFINER", self.sql)
+
     def test_migration_does_not_mutate_existing_evidence_or_orchestrate_bronze(self) -> None:
         self.assertNotRegex(self.sql, r"(?im)^\s*(UPDATE|DELETE)\s+")
         for forbidden in (

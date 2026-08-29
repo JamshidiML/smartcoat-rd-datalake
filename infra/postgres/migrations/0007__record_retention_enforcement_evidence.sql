@@ -85,8 +85,7 @@ BEGIN
     SELECT *
     INTO assignment
     FROM bronze_retention_assignments
-    WHERE retention_assignment_id = NEW.retention_assignment_id
-    FOR KEY SHARE;
+    WHERE retention_assignment_id = NEW.retention_assignment_id;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Retention assignment does not exist for enforcement evidence';
@@ -116,6 +115,40 @@ FOR EACH ROW EXECUTE FUNCTION validate_bronze_retention_enforcement_evidence();
 CREATE TRIGGER bronze_retention_enforcement_evidence_append_only
 BEFORE UPDATE OR DELETE ON bronze_retention_enforcement_evidence
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_mutation();
+
+-- Migration 0005 used a KEY SHARE row lock while validating an immutable
+-- Bronze parent. PostgreSQL classifies that lock as UPDATE authority, which
+-- conflicts with the split-role rule that ingestion has no UPDATE privilege.
+-- The foreign key and append-only guard already prevent parent deletion or
+-- mutation, so retain the exact identity validation with SELECT-only access.
+CREATE OR REPLACE FUNCTION validate_bronze_retention_assignment()
+RETURNS trigger LANGUAGE plpgsql AS $assignment_guard$
+DECLARE
+    bronze_record bronze_objects%ROWTYPE;
+BEGIN
+    SELECT *
+    INTO bronze_record
+    FROM bronze_objects
+    WHERE bronze_object_id = NEW.bronze_object_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Bronze object does not exist for retention assignment';
+    END IF;
+
+    IF bronze_record.ingestion_id <> NEW.ingestion_id
+        OR bronze_record.bucket_name <> NEW.bucket_name
+        OR bronze_record.object_key <> NEW.object_key
+        OR bronze_record.object_kind <> NEW.object_kind
+        OR bronze_record.object_version_id IS NULL
+        OR btrim(bronze_record.object_version_id) = ''
+        OR bronze_record.object_version_id <> NEW.object_version_id
+    THEN
+        RAISE EXCEPTION 'Retention assignment does not match exact Bronze version identity';
+    END IF;
+
+    RETURN NEW;
+END;
+$assignment_guard$;
 
 -- Reconcile retention tables created after M0-R02 with the split runtime-role
 -- contract.  The legacy shared identity stays disabled and receives no
