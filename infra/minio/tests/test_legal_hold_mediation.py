@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 MINIO = ROOT / "infra" / "minio"
 APPLIER = ROOT / "apps" / "legal-hold-applier" / "src"
+RUNBOOK = ROOT / "docs" / "runbooks" / "LEGAL_HOLD_AUTHORITY.md"
 
 
 def compose_service(compose: str, name: str) -> str:
@@ -115,6 +116,26 @@ class AuthorityPolicyTests(unittest.TestCase):
 
 
 class RuntimeBoundaryTests(unittest.TestCase):
+    def test_runbook_documents_authenticated_mediator_contract(self) -> None:
+        runbook = RUNBOOK.read_text()
+        for marker in (
+            "LEGAL_HOLD_APPLIER_CALL_TOKEN",
+            "Authorization",
+            "Bearer",
+            "/apply",
+            "/status",
+            "/healthz",
+            "401",
+            "break-glass",
+        ):
+            self.assertIn(marker, runbook)
+        self.assertIn("There is no unauthenticated `/apply` operation.", runbook)
+        self.assertNotRegex(
+            runbook.lower(),
+            r"(?:unauthenticated|without authentication).*?/apply.*?"
+            r"(?:allowed|accepted|available)",
+        )
+
     def test_mediator_implementation_has_no_off_method_or_generic_action(self) -> None:
         source = (APPLIER / "main.py").read_text()
         self.assertIn("enable_object_legal_hold", source)

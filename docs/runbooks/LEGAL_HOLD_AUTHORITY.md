@@ -4,15 +4,19 @@
 
 SmartCoat uses `CONTROLLED_MEDIATION_REQUIRED` for legal-hold application. The pinned MinIO runtime does not reliably enforce an ON-only IAM condition for `s3:PutObjectLegalHold`, so no ordinary application identity receives that permission.
 
-The `legal-hold-applier` service is an internal, non-root, backend-only boundary. It publishes no host port and is absent from the edge network. Its MinIO credential is injected only into the one-shot bootstrap and the mediator. API, ingestion, OCR, reviewer, backup, and web runtimes do not receive it.
+The `legal-hold-applier` service is an internal, non-root, backend-only boundary. It publishes no host port and is absent from the edge network. Its MinIO credential is injected only into the one-shot bootstrap and the mediator. API, ingestion, OCR, reviewer, backup, and web runtimes do not receive the MinIO mediator credential.
 
-The mediator accepts only:
+Calling the mediator is a separate authority. `LEGAL_HOLD_APPLIER_CALL_TOKEN` is required and must be a distinct high-entropy, single-line secret of at least 32 characters. Compose makes this caller token available only to the API and `legal-hold-applier`. OCR, reviewer, backup, web, MinIO bootstrap, migration, role-provisioning, and other runtime contexts must not receive it.
 
-- approved Bronze bucket;
-- `rd/` object key;
-- exact version ID.
+The mediator accepts only an exact approved target consisting of:
 
-It exposes no status or operation parameter. Its implementation always calls legal-hold ON, reads back the same version, and reports success only after ON is confirmed. It has no object write, delete, retention-change, bypass, bucket-administration, or legal-hold OFF interface.
+- an approved Bronze bucket;
+- an approved `rd/` object key;
+- an exact `version_id`.
+
+`POST /apply` requires `Authorization: Bearer <token>`. It can only apply Legal Hold ON to that exact `bucket` + `object_key` + `version_id`, reads back the same version, and reports success only after ON is confirmed. `POST /status` requires the same Bearer token and performs read-only exact-version status observation. `GET /healthz` remains unauthenticated and exposes health only.
+
+There is no unauthenticated `/apply` operation. A missing or wrong token returns `401` before request-body processing or any MinIO storage call, so it cannot cause a storage mutation. The mediator has no normal-runtime OFF operation, generic MinIO proxy, object write, delete, retention-change, bypass, or bucket-administration interface.
 
 ## Runtime configuration
 
@@ -20,14 +24,17 @@ Configure distinct values for these variable names without committing their valu
 
 - `MINIO_HOLD_APPLIER_ACCESS_KEY`
 - `MINIO_HOLD_APPLIER_SECRET_KEY`
+- `LEGAL_HOLD_APPLIER_CALL_TOKEN`
+
+The caller token must never be committed, logged, printed, placed in command output, or included in acceptance evidence. Supply it through the local secret environment only. Do not reuse either MinIO credential as the caller token.
 
 Start through the normal Compose workflow. Verify the rendered `legal-hold-applier` service has only the `backend` network, an internal container exposure on `8090`, and no `ports` entry.
 
-An internal caller applies a hold with `POST http://legal-hold-applier:8090/apply` and an exact JSON object containing `bucket`, `object_key`, and `version_id`. Additional fields, including `status`, are rejected.
+An authenticated API-side caller applies a hold with `POST http://legal-hold-applier:8090/apply`, an `Authorization: Bearer` header sourced from the environment, and an exact JSON object containing `bucket`, `object_key`, and `version_id`. Additional fields, including a requested hold status or generic operation, are rejected. Read-only observation uses the same exact JSON target with `POST http://legal-hold-applier:8090/status` and the same Bearer header.
 
 ## Break-glass OFF
 
-Legal-hold clearing is not part of the mediator or normal runtime. It is an operator-only mechanism using a separately provisioned credential and the pinned MinIO client image. Never inject the break-glass credential into Compose services.
+Legal-hold clearing is not part of the mediator or normal runtime. Break-glass OFF remains a separate operator-only mechanism using a separately provisioned credential and the pinned MinIO client image. Never inject the break-glass credential into Compose services, and never treat the caller token as break-glass authority.
 
 Provision the authority only through `infra/minio/provision_legal_hold_break_glass.sh` with its exact confirmation. The operator environment must explicitly provide the endpoint, root provisioning identity, distinct break-glass identity, and `LEGAL_HOLD_CONTROL_ROOT`. Do not use the repository `.env` as an operator credential source.
 
