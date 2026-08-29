@@ -214,6 +214,32 @@ class RuntimeRoleContractTests(unittest.TestCase):
             )
         )
 
+    def test_legacy_reconciliation_evidence_is_backup_read_only(self) -> None:
+        self.assertEqual(
+            {
+                "legacy_reconciliation_runs",
+                "legacy_reconciliation_items",
+                "legacy_reconciliation_successes",
+            },
+            set(rbac_contract.LEGACY_RECONCILIATION_TABLES),
+        )
+        privileges = {
+            item
+            for item in rbac_contract.TABLE_PRIVILEGES
+            if item[1] in rbac_contract.LEGACY_RECONCILIATION_TABLES
+        }
+        self.assertEqual(
+            {
+                ("smartcoat_backup", table, "SELECT")
+                for table in rbac_contract.LEGACY_RECONCILIATION_TABLES
+            },
+            privileges,
+        )
+        self.assertFalse(any(
+            item[1] in rbac_contract.LEGACY_RECONCILIATION_TABLES
+            for item in rbac_contract.COLUMN_UPDATE_PRIVILEGES
+        ))
+
 
 class CredentialProvisioningBoundaryTests(unittest.TestCase):
     def test_admin_url_is_explicit_and_database_url_is_not_a_fallback(self) -> None:

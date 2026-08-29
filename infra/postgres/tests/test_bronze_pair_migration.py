@@ -20,8 +20,12 @@ class BronzePairMigrationTests(unittest.TestCase):
 
     def test_collision_free_monotonic_migration_identity(self) -> None:
         names = sorted(path.name for path in MIGRATIONS.glob("[0-9][0-9][0-9][0-9]__*.sql"))
-        self.assertEqual(list(range(1, 9)), [int(name[:4]) for name in names])
-        self.assertEqual("0008__enforce_bronze_pair_commit_and_orphans.sql", names[-1])
+        bronze_pair_prefix = [name for name in names if int(name[:4]) <= 8]
+        self.assertEqual(list(range(1, 9)), [int(name[:4]) for name in bronze_pair_prefix])
+        self.assertEqual(
+            "0008__enforce_bronze_pair_commit_and_orphans.sql",
+            bronze_pair_prefix[-1],
+        )
 
     def test_pair_orphan_and_reconciliation_evidence_are_append_only(self) -> None:
         for table in (

@@ -77,7 +77,18 @@ BRONZE_PAIR_TABLES = (
     "bronze_reconciliation_events",
 )
 
-PUBLIC_TABLES = CORE_PUBLIC_TABLES + RETENTION_TABLES + BRONZE_PAIR_TABLES
+LEGACY_RECONCILIATION_TABLES = (
+    "legacy_reconciliation_runs",
+    "legacy_reconciliation_items",
+    "legacy_reconciliation_successes",
+)
+
+PUBLIC_TABLES = (
+    CORE_PUBLIC_TABLES
+    + RETENTION_TABLES
+    + BRONZE_PAIR_TABLES
+    + LEGACY_RECONCILIATION_TABLES
+)
 
 TABLE_PRIVILEGES = frozenset(
     {
@@ -157,6 +168,7 @@ PROTECTED_APPEND_ONLY_TABLES = (
     "audit_events",
     *RETENTION_TABLES,
     *BRONZE_PAIR_TABLES,
+    *LEGACY_RECONCILIATION_TABLES,
 )
 
 ROLE_ATTRIBUTE_QUERY = """
