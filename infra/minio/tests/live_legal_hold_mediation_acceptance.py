@@ -23,7 +23,7 @@ MC_REF = "minio/mc:RELEASE.2025-07-21T05-28-08Z"
 SDK_REF = "smartcoat-rd-datalake-api:latest"
 CONFIRM_FLAG = "--confirm-disposable-synthetic-legal-hold-mediation-run"
 APPLIER_IMAGE_FLAG = "--legal-hold-applier-image"
-PASS = "PASS_LEGAL_HOLD_AUTHORITY_READY_PRODUCTION_IMAGE"
+PASS = "PASS_LEGAL_HOLD_CALLER_AUTH_REMEDIATION"
 FAIL = "FAIL_LEGAL_HOLD_AUTHORITY_READY"
 LABEL = "smartcoat.legal-hold-mediation.project"
 PROJECT = re.compile(r"^m0hold-[0-9a-f]{12}$")
@@ -199,14 +199,24 @@ def http_request(
     sdk_image: str,
     payload: dict[str, Any],
     *,
+    call_token: str | None = None,
+    operation: str = "apply",
+    context: str = "backend-peer",
     expect_reachable: bool = True,
 ) -> dict[str, Any]:
     script = """
 import json, os, urllib.error, urllib.request
 request = urllib.request.Request(
-    'http://legal-hold-applier:8090/apply',
+    'http://legal-hold-applier:8090/' + os.environ['OPERATION'],
     data=os.environ['PAYLOAD'].encode(),
-    headers={'Content-Type': 'application/json'},
+    headers={
+        'Content-Type': 'application/json',
+        **(
+            {'Authorization': 'Bearer ' + os.environ['CALL_TOKEN']}
+            if os.environ.get('CALL_TOKEN')
+            else {}
+        ),
+    },
     method='POST',
 )
 try:
@@ -219,16 +229,22 @@ except urllib.error.HTTPError as exc:
 except Exception:
     print(json.dumps({'reachable': False}, sort_keys=True))
 """
-    result = run(
-        [
-            "docker", "run", "--rm", "--pull=never",
-            "--name", f"{project}-http-{secrets.token_hex(3)}",
-            "--label", f"{LABEL}={project}", "--network", network,
-            "--env", "PAYLOAD", "--entrypoint", "python", sdk_image,
-            "-c", script,
-        ],
-        environment={"PAYLOAD": json.dumps(payload, separators=(",", ":"))},
-    )
+    environment = {
+        "PAYLOAD": json.dumps(payload, separators=(",", ":")),
+        "OPERATION": operation,
+        "SMARTCOAT_CONTEXT": context,
+    }
+    if call_token is not None:
+        environment["CALL_TOKEN"] = call_token
+    command = [
+        "docker", "run", "--rm", "--pull=never",
+        "--name", f"{project}-http-{secrets.token_hex(3)}",
+        "--label", f"{LABEL}={project}", "--network", network,
+    ]
+    for name in environment:
+        command.extend(["--env", name])
+    command.extend(["--entrypoint", "python", sdk_image, "-c", script])
+    result = run(command, environment=environment)
     value = json.loads(result.stdout)
     if bool(value.get("reachable")) != expect_reachable:
         raise AcceptanceFailure("network reachability did not match the mediation boundary")
@@ -312,7 +328,14 @@ def live(applier_reference: str) -> tuple[str, dict[str, Any]]:
         name: {"ACCESS_KEY": f"{name}{secrets.token_hex(6)}", "SECRET_KEY": secrets.token_hex(24)}
         for name in ("app", "ocr", "reviewer", "backup", "mediator", "breakglass")
     }
-    secrets_to_hide = [*root.values(), *(value for item in identities.values() for value in item.values())]
+    call_token = secrets.token_urlsafe(48)
+    wrong_call_token = secrets.token_urlsafe(48)
+    secrets_to_hide = [
+        *root.values(),
+        *(value for item in identities.values() for value in item.values()),
+        call_token,
+        wrong_call_token,
+    ]
     constructed = False
     evidence: dict[str, Any] = {
         "project": project,
@@ -418,6 +441,7 @@ print(json.dumps({'versions': versions}, sort_keys=True))
             "MINIO_HOLD_APPLIER_SECURE": "false",
             "MINIO_HOLD_APPLIER_ACCESS_KEY": identities["mediator"]["ACCESS_KEY"],
             "MINIO_HOLD_APPLIER_SECRET_KEY": identities["mediator"]["SECRET_KEY"],
+            "LEGAL_HOLD_APPLIER_CALL_TOKEN": call_token,
             "LEGAL_HOLD_APPLIER_PORT": "8090",
         }
         mediator_run = [
@@ -432,21 +456,27 @@ print(json.dumps({'versions': versions}, sort_keys=True))
         run(mediator_run, environment=mediator_environment)
 
         context_names: list[str] = []
-        for context in ("api", "ocr"):
+        for context in ("api", "ocr", "reviewer", "backup", "web"):
             name = f"{project}-{context}-context"
             context_names.append(name)
-            docker(
+            arguments = [
                 "run", "-d", "--pull=never", "--name", name,
                 "--label", f"{LABEL}={project}", "--network", backend,
                 "--env", f"SMARTCOAT_CONTEXT={context}",
-                "--entrypoint", "sleep", images["sdk"], "120",
-            )
+            ]
+            context_environment: dict[str, str] = {}
+            if context == "api":
+                arguments.extend(["--env", "LEGAL_HOLD_APPLIER_CALL_TOKEN"])
+                context_environment["LEGAL_HOLD_APPLIER_CALL_TOKEN"] = call_token
+            arguments.extend(["--entrypoint", "sleep", images["sdk"], "120"])
+            run(["docker", *arguments], environment=context_environment)
 
         ready = False
         for _ in range(30):
             probe = http_request(
                 project, backend, images["sdk"],
                 {"bucket": "unapproved", "object_key": "rd/probe", "version_id": "probe"},
+                call_token=call_token,
             )
             if probe.get("status") == 400:
                 ready = True
@@ -463,12 +493,21 @@ print(json.dumps({'versions': versions}, sort_keys=True))
         ).stdout.strip()
         if set(mediator_inspect) != {backend} or port_bindings not in {"null", "{}"}:
             raise AcceptanceFailure("mediator escaped backend-only no-host-port isolation")
+        context_token_presence: dict[str, bool] = {}
         for name in context_names:
             context_environment = json.loads(
                 docker("inspect", name, "--format", "{{json .Config.Env}}").stdout
             )
             if any(item.startswith("MINIO_HOLD_APPLIER_") for item in context_environment):
                 raise AcceptanceFailure("mediator credential leaked into an ordinary context")
+            context = name.removeprefix(f"{project}-").removesuffix("-context")
+            has_call_token = any(
+                item.startswith("LEGAL_HOLD_APPLIER_CALL_TOKEN=")
+                for item in context_environment
+            )
+            context_token_presence[context] = has_call_token
+            if has_call_token != (context == "api"):
+                raise AcceptanceFailure("caller token escaped its API-only context")
 
         direct_negative: dict[str, dict[str, bool]] = {}
         for identity in ("app", "ocr", "reviewer", "backup"):
@@ -483,29 +522,30 @@ print(json.dumps({'versions': versions}, sort_keys=True))
         if not all(all(result.values()) for result in direct_negative.values()):
             raise AcceptanceFailure("an ordinary identity obtained direct legal-hold authority")
 
+        authenticated = {"call_token": call_token, "context": "api"}
         malformed_results = {
             "status_off": http_request(project, backend, images["sdk"], {
                 "bucket": "sc-rd-bronze-originals",
                 "object_key": "rd/synthetic/evidence.bin",
                 "version_id": version_one,
                 "status": "OFF",
-            }),
+            }, **authenticated),
             "generic_proxy": http_request(project, backend, images["sdk"], {
                 "action": "delete", "bucket": "sc-rd-bronze-originals",
                 "object_key": "rd/synthetic/evidence.bin", "version_id": version_one,
-            }),
+            }, **authenticated),
             "unauthorized_bucket": http_request(project, backend, images["sdk"], {
                 "bucket": "sc-rd-ocr-artifacts",
                 "object_key": "rd/synthetic/evidence.bin", "version_id": version_one,
-            }),
+            }, **authenticated),
             "missing_version": http_request(project, backend, images["sdk"], {
                 "bucket": "sc-rd-bronze-originals",
                 "object_key": "rd/synthetic/evidence.bin",
-            }),
+            }, **authenticated),
             "malformed_version": http_request(project, backend, images["sdk"], {
                 "bucket": "sc-rd-bronze-originals",
                 "object_key": "rd/synthetic/evidence.bin", "version_id": "bad/version",
-            }),
+            }, **authenticated),
         }
         if not all(value.get("status") == 400 for value in malformed_results.values()):
             raise AcceptanceFailure("mediator accepted a non-ON or proxy-style request")
@@ -513,11 +553,48 @@ print(json.dumps({'versions': versions}, sort_keys=True))
         edge_probe = http_request(
             project, edge, images["sdk"],
             {"bucket": "sc-rd-bronze-originals", "object_key": "rd/synthetic/evidence.bin", "version_id": version_one},
+            call_token=call_token,
+            context="api",
             expect_reachable=False,
         )
+        if legal_hold_status(project, backend, images["sdk"], root, version_one) != "OFF":
+            raise AcceptanceFailure("target version was not OFF before caller-auth negatives")
+        unauthenticated = http_request(
+            project,
+            backend,
+            images["sdk"],
+            {
+                "bucket": "sc-rd-bronze-originals",
+                "object_key": "rd/synthetic/evidence.bin",
+                "version_id": version_one,
+            },
+            context="backend-peer",
+        )
+        if unauthenticated.get("status") != 401:
+            raise AcceptanceFailure("backend peer without token was not denied")
+        if legal_hold_status(project, backend, images["sdk"], root, version_one) != "OFF":
+            raise AcceptanceFailure("unauthenticated request mutated legal hold")
+        wrong_token = http_request(
+            project,
+            backend,
+            images["sdk"],
+            {
+                "bucket": "sc-rd-bronze-originals",
+                "object_key": "rd/synthetic/evidence.bin",
+                "version_id": version_one,
+            },
+            call_token=wrong_call_token,
+            context="backend-peer",
+        )
+        if wrong_token.get("status") != 401:
+            raise AcceptanceFailure("backend peer with wrong token was not denied")
+        if legal_hold_status(project, backend, images["sdk"], root, version_one) != "OFF":
+            raise AcceptanceFailure("wrong-token request mutated legal hold")
         applied = http_request(
             project, backend, images["sdk"],
             {"bucket": "sc-rd-bronze-originals", "object_key": "rd/synthetic/evidence.bin", "version_id": version_one},
+            call_token=call_token,
+            context="api",
         )
         if applied.get("status") != 200 or applied.get("body", {}).get("legal_hold") != "ON":
             raise AcceptanceFailure("mediator exact-version ON request did not pass")
@@ -525,6 +602,23 @@ print(json.dumps({'versions': versions}, sort_keys=True))
             raise AcceptanceFailure("mediator ON read-back was not independently confirmed")
         if legal_hold_status(project, backend, images["sdk"], root, version_two) != "OFF":
             raise AcceptanceFailure("mediator changed a version other than the exact target")
+        status_readback = http_request(
+            project,
+            backend,
+            images["sdk"],
+            {
+                "bucket": "sc-rd-bronze-originals",
+                "object_key": "rd/synthetic/evidence.bin",
+                "version_id": version_one,
+            },
+            call_token=call_token,
+            operation="status",
+            context="api",
+        )
+        if status_readback.get("status") != 200 or status_readback.get("body", {}).get(
+            "legal_hold"
+        ) != "ON":
+            raise AcceptanceFailure("authenticated status read-back failed")
         if not direct_hold_attempt(
             project, backend, images["mc"], identities["app"], version_one, "OFF"
         ):
@@ -624,9 +718,19 @@ mc rm --force --version-id "$VERSION_ID" local/sc-rd-bronze-originals/rd/synthet
             "credential_isolation": {
                 "api_context_has_mediator_credential": False,
                 "ocr_context_has_mediator_credential": False,
+                "caller_token_presence": context_token_presence,
+                "caller_token_confined_to_api_and_mediator": True,
                 "ordinary_direct_attempts": direct_negative,
             },
             "mediator": {
+                "caller_authentication": {
+                    "authenticated_api_apply": applied["status"],
+                    "authenticated_status_readback": status_readback["status"],
+                    "backend_peer_without_token": unauthenticated["status"],
+                    "backend_peer_wrong_token": wrong_token["status"],
+                    "unauthenticated_mutation": False,
+                    "wrong_token_mutation": False,
+                },
                 "request_contract_rejections": {
                     name: value["status"] for name, value in malformed_results.items()
                 },

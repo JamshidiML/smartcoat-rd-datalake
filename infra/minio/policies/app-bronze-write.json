@@ -11,7 +11,13 @@
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:PutObjectRetention"],
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:GetObjectRetention",
+        "s3:PutObject",
+        "s3:PutObjectRetention"
+      ],
       "Resource": [
         "arn:aws:s3:::sc-rd-bronze-originals/rd/*",
         "arn:aws:s3:::sc-rd-bronze-manifests/rd/*"

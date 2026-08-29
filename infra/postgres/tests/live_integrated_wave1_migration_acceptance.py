@@ -58,10 +58,10 @@ INTEGRATED_PROTECTED_HASHES = {
         "e12d98beeb6641f0eba3bad70167fb54759d2b37dcbfe9e08819df1a310ab3e6"
     ),
     "compose.yaml": (
-        "6fd49bf74e230fea5f9d4d0fcede80f4b2a52e6d10db2658c0b2b450bd114535"
+        "c4bdd04dd3b06c55497b4caac97f6946f34c97cab816d607977e254031eba992"
     ),
     ".env.example": (
-        "0d4467f98fa88d65489e8582c3cca07d221a7c5d0ed6c208cccc0f25fcdb0c36"
+        "c4705ad2e9d4c0ad50de7306edb70d4c5548b62726e13209da80fac5b7b21f02"
     ),
     "docs/runbooks/VPS_DEPLOYMENT.md": (
         "0df81839b3a159361e76115076ad29fc859d05c2c42a000337c25c811b798901"
@@ -145,6 +145,11 @@ def patch_lifecycle_harness(accepted: ModuleType) -> None:
             "POSTGRES_OCR_PASSWORD": secrets.token_hex(24),
             "POSTGRES_REVIEW_PASSWORD": secrets.token_hex(24),
             "POSTGRES_BACKUP_PASSWORD": secrets.token_hex(24),
+            "MINIO_HOLD_APPLIER_ACCESS_KEY": (
+                "m0r0141-hold-" + secrets.token_hex(8)
+            ),
+            "MINIO_HOLD_APPLIER_SECRET_KEY": secrets.token_hex(24),
+            "LEGAL_HOLD_APPLIER_CALL_TOKEN": secrets.token_urlsafe(48),
         }
         urls = {
             "DATABASE_INGESTION_URL": (

@@ -77,6 +77,7 @@ services:
       MINIO_HOLD_APPLIER_SECURE: "false"
       MINIO_HOLD_APPLIER_ACCESS_KEY: ${MINIO_HOLD_APPLIER_ACCESS_KEY:?MINIO_HOLD_APPLIER_ACCESS_KEY must be explicitly configured}
       MINIO_HOLD_APPLIER_SECRET_KEY: ${MINIO_HOLD_APPLIER_SECRET_KEY:?MINIO_HOLD_APPLIER_SECRET_KEY must be explicitly configured}
+      LEGAL_HOLD_APPLIER_CALL_TOKEN: ${LEGAL_HOLD_APPLIER_CALL_TOKEN:?LEGAL_HOLD_APPLIER_CALL_TOKEN must be explicitly configured}
       LEGAL_HOLD_APPLIER_PORT: "8090"
     expose: ["8090"]
     healthcheck:
@@ -135,6 +136,8 @@ services:
         condition: service_completed_successfully
       postgres-role-provision:
         condition: service_completed_successfully
+      legal-hold-applier:
+        condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_INGESTION_URL:?DATABASE_INGESTION_URL must be explicitly configured}
       REVIEW_DATABASE_URL: ${DATABASE_REVIEW_URL:?DATABASE_REVIEW_URL must be explicitly configured}
@@ -142,6 +145,8 @@ services:
       MINIO_SECURE: ${MINIO_SECURE:-false}
       MINIO_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_APP_SECRET_KEY}
+      LEGAL_HOLD_APPLIER_URL: http://legal-hold-applier:8090
+      LEGAL_HOLD_APPLIER_CALL_TOKEN: ${LEGAL_HOLD_APPLIER_CALL_TOKEN:?LEGAL_HOLD_APPLIER_CALL_TOKEN must be explicitly configured}
       LOCAL_USER_ID: ${LOCAL_USER_ID:-usr_founder}
       LOCAL_USER_DISPLAY_NAME: ${LOCAL_USER_DISPLAY_NAME:-SmartCoat Founder}
       LOCAL_USER_EMAIL: ${LOCAL_USER_EMAIL:-founder@localhost}

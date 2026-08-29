@@ -51,7 +51,7 @@ RUNTIME_ROLES: Mapping[str, RuntimeRole] = MappingProxyType(
 
 ROLE_NAMES = tuple(role.name for role in RUNTIME_ROLES.values())
 
-PUBLIC_TABLES = (
+CORE_PUBLIC_TABLES = (
     "users",
     "uploads",
     "bronze_objects",
@@ -63,14 +63,30 @@ PUBLIC_TABLES = (
     "audit_events",
 )
 
+RETENTION_TABLES = (
+    "canonical_retention_classes",
+    "retention_policy_versions",
+    "retention_category_rules",
+    "bronze_retention_assignments",
+    "bronze_retention_enforcement_evidence",
+)
+
+PUBLIC_TABLES = CORE_PUBLIC_TABLES + RETENTION_TABLES
+
 TABLE_PRIVILEGES = frozenset(
     {
         # The API read side uses the ingestion connection.  Read visibility is
         # intentionally broader than write authority in this single-user slice.
-        *(("smartcoat_ingestion", table, "SELECT") for table in PUBLIC_TABLES),
+        *(("smartcoat_ingestion", table, "SELECT") for table in CORE_PUBLIC_TABLES),
+        *(("smartcoat_ingestion", table, "SELECT") for table in (
+            "bronze_retention_assignments",
+            "bronze_retention_enforcement_evidence",
+        )),
         *(("smartcoat_backup", table, "SELECT") for table in PUBLIC_TABLES),
         *(("smartcoat_ingestion", table, "INSERT") for table in (
-            "users", "uploads", "bronze_objects", "ocr_jobs", "audit_events"
+            "users", "uploads", "bronze_objects", "ocr_jobs", "audit_events",
+            "bronze_retention_assignments",
+            "bronze_retention_enforcement_evidence",
         )),
         *(("smartcoat_ocr", table, "SELECT") for table in (
             "uploads", "ocr_jobs", "ocr_runs"
@@ -131,6 +147,7 @@ PROTECTED_APPEND_ONLY_TABLES = (
     "silver_verified_records",
     "review_decisions",
     "audit_events",
+    *RETENTION_TABLES,
 )
 
 ROLE_ATTRIBUTE_QUERY = """

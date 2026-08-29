@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import secrets
 import stat
 import sys
 from pathlib import Path
@@ -21,15 +22,23 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 LIFECYCLE_PATH = ROOT / "infra/postgres/tests/live_migration_lifecycle_acceptance.py"
-CANDIDATE_MIGRATION = (
-    ROOT / "infra/postgres/migrations/0005__expand_retention_metadata.sql"
+CANDIDATE_MIGRATIONS = tuple(
+    ROOT / "infra/postgres/migrations" / name
+    for name in (
+        "0002__separate_runtime_roles.sql",
+        "0003__enforce_upload_state_transitions.sql",
+        "0004__enforce_atomic_review_decisions.sql",
+        "0005__expand_retention_metadata.sql",
+        "0006__grant_review_audit_evidence_read.sql",
+        "0007__record_retention_enforcement_evidence.sql",
+    )
 )
 POLICY_MODULE_PATH = ROOT / "apps/api/src/retention_policy.py"
 EXPECTED_LIFECYCLE_SHA256 = (
     "4d7fbe8d33d36b6ff50161f4374cf16477667903253b790cbc37cb3e54707cfd"
 )
 AUTHORIZATION_FLAG = "--confirm-disposable-synthetic-retention-metadata-run"
-PASS = "PASS_METADATA_EXPAND"
+PASS = "PASS_RETENTION_ENFORCEMENT_EVIDENCE"
 BLOCKED_ISOLATION = "BLOCKED_ISOLATION"
 BLOCKED_IMPLEMENTATION_BOUNDARY = "BLOCKED_IMPLEMENTATION_BOUNDARY"
 
@@ -155,27 +164,83 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
     def __init__(self, scenario: str) -> None:
         super().__init__()
         self.scenario = scenario
-        self.candidate_fixture = (
-            self.migration_fixture_directory / CANDIDATE_MIGRATION.name
+        self.synthetic_hold_applier_secret = secrets.token_hex(24)
+        self.synthetic_hold_call_token = secrets.token_urlsafe(48)
+        self.runtime_passwords = {
+            "ingestion": secrets.token_hex(24),
+            "ocr": secrets.token_hex(24),
+            "review": secrets.token_hex(24),
+            "backup": secrets.token_hex(24),
+        }
+        self.secret_values.update(
+            {
+                self.synthetic_hold_applier_secret,
+                self.synthetic_hold_call_token,
+                *self.runtime_passwords.values(),
+            }
+        )
+        self.candidate_fixtures = tuple(
+            self.migration_fixture_directory / migration.name
+            for migration in CANDIDATE_MIGRATIONS
         )
         self.evidence["scenario"] = scenario
 
-    def install_candidate_fixture(self) -> str:
-        self._require(
-            not self.candidate_fixture.exists(),
-            "Candidate fixture unexpectedly existed before controlled installation",
-        )
-        source = CANDIDATE_MIGRATION.read_bytes()
-        self.candidate_fixture.write_bytes(source)
-        self.candidate_fixture.chmod(0o400)
-        self._require(
-            self.candidate_fixture.stat().st_uid == self.temporary_directory.stat().st_uid
-            and stat.S_IMODE(self.candidate_fixture.stat().st_mode) == 0o400
-            and self.candidate_fixture.read_bytes() == source,
-            "Candidate fixture ownership, mode, or bytes are invalid",
-            lifecycle.IsolationBlocked,
-        )
-        return hashlib.sha256(source).hexdigest()
+    def _write_synthetic_configuration(self) -> None:
+        """Supply integration-required credentials only to disposable config."""
+
+        super()._write_synthetic_configuration()
+        with self.environment_file.open("a", encoding="utf-8") as handle:
+            handle.write("MINIO_HOLD_APPLIER_ACCESS_KEY=m0r0141-hold-applier\n")
+            handle.write(
+                "MINIO_HOLD_APPLIER_SECRET_KEY="
+                f"{self.synthetic_hold_applier_secret}\n"
+            )
+            handle.write(
+                "LEGAL_HOLD_APPLIER_CALL_TOKEN="
+                f"{self.synthetic_hold_call_token}\n"
+            )
+            handle.write("POSTGRES_ROLE_ADMIN_URL=" + self.migration_database_url + "\n")
+            handle.write(
+                "POSTGRES_INGESTION_PASSWORD="
+                f"{self.runtime_passwords['ingestion']}\n"
+            )
+            handle.write(
+                "POSTGRES_OCR_PASSWORD=" f"{self.runtime_passwords['ocr']}\n"
+            )
+            handle.write(
+                "POSTGRES_REVIEW_PASSWORD=" f"{self.runtime_passwords['review']}\n"
+            )
+            handle.write(
+                "POSTGRES_BACKUP_PASSWORD=" f"{self.runtime_passwords['backup']}\n"
+            )
+            for workflow in ("ingestion", "ocr", "review", "backup"):
+                handle.write(
+                    f"DATABASE_{workflow.upper()}_URL="
+                    f"postgresql://smartcoat_{workflow}:"
+                    f"{self.runtime_passwords[workflow]}@postgres:5432/"
+                    f"{self.database_name}\n"
+                )
+        self.environment_file.chmod(0o600)
+
+    def install_candidate_fixtures(self) -> dict[int, str]:
+        result: dict[int, str] = {}
+        for migration, fixture in zip(CANDIDATE_MIGRATIONS, self.candidate_fixtures):
+            self._require(
+                not fixture.exists(),
+                "Candidate fixture unexpectedly existed before controlled installation",
+            )
+            source = migration.read_bytes()
+            fixture.write_bytes(source)
+            fixture.chmod(0o400)
+            self._require(
+                fixture.stat().st_uid == self.temporary_directory.stat().st_uid
+                and stat.S_IMODE(fixture.stat().st_mode) == 0o400
+                and fixture.read_bytes() == source,
+                "Candidate fixture ownership, mode, or bytes are invalid",
+                lifecycle.IsolationBlocked,
+            )
+            result[int(migration.name[:4])] = hashlib.sha256(source).hexdigest()
+        return result
 
     def _negative_insert(self, label: str, statement: str, marker: str) -> None:
         result = self._psql(label, statement)
@@ -210,20 +275,20 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
             self._psql_success("install_legacy_fixture", LEGACY_FIXTURE_SQL)
         legacy_before = self._psql_rows("bronze_before_migration", BRONZE_SNAPSHOT_SQL)
 
-        candidate_sha = self.install_candidate_fixture()
+        candidate_hashes = self.install_candidate_fixtures()
         applied = self._run_migration("apply_metadata_expand")
         self._require(
             applied.returncode == 0
-            and "discovered=2" in applied.stdout
-            and "applied_now=1" in applied.stdout,
-            "METADATA_EXPAND did not apply exactly once",
+            and "discovered=7" in applied.stdout
+            and "applied_now=6" in applied.stdout,
+            "Wave-1 and retention migrations did not apply exactly once",
         )
         repeated = self._run_migration("reapply_metadata_expand")
         self._require(
             repeated.returncode == 0
-            and "already_applied=2" in repeated.stdout
+            and "already_applied=7" in repeated.stdout
             and "applied_now=0" in repeated.stdout,
-            "METADATA_EXPAND reapplication was not idempotent",
+            "Retention migration reapplication was not idempotent",
         )
 
         legacy_after = self._psql_rows("bronze_after_migration", BRONZE_SNAPSHOT_SQL)
@@ -418,6 +483,7 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
         self._psql_success(
             "insert_valid_exact_version_assignment",
             """
+            SET ROLE smartcoat_ingestion;
             INSERT INTO bronze_retention_assignments (
               retention_assignment_id, bronze_object_id, ingestion_id, bucket_name,
               object_key, object_kind, object_version_id, data_category,
@@ -433,7 +499,8 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
               'smartcoat_retention_2026_08_v1', TIMESTAMPTZ '2026-08-20T00:01:00Z',
               'synthetic_rule', TIMESTAMPTZ '2026-08-20T00:00:00Z',
               TIMESTAMPTZ '2036-08-20T00:00:00Z', true
-            )
+            );
+            RESET ROLE
             """,
         )
         self._negative_insert(
@@ -441,10 +508,198 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
             "UPDATE bronze_retention_assignments SET retention_assigned_by = 'forbidden'",
             "append-only",
         )
+        self._psql_success(
+            "insert_exact_version_enforcement_success",
+            """
+            SET ROLE smartcoat_ingestion;
+            INSERT INTO bronze_retention_enforcement_evidence (
+              enforcement_evidence_id, retention_assignment_id, bucket_name,
+              object_key, object_kind, object_version_id, data_category,
+              retention_class, retention_policy_version, accepted_storage_at_utc,
+              requested_retention_mode, requested_retain_until_utc,
+              requested_legal_hold_status, observed_object_version_id,
+              observed_retention_mode, observed_retain_until_utc,
+              observed_legal_hold_status, enforcement_verified_at_utc,
+              enforcement_verification_result, failure_code, enforced_by,
+              details_json
+            ) VALUES (
+              '00000000-0000-7000-8000-000000000526',
+              '00000000-0000-7000-8000-000000000524',
+              'sc-rd-bronze-manifests', 'synthetic/cand-meta/manifest.json',
+              'MANIFEST', 'synthetic-version-manifest-1', 'LAB_NOTE',
+              'permanent', 'smartcoat_retention_2026_08_v1',
+              TIMESTAMPTZ '2026-08-20T00:00:00Z', 'COMPLIANCE',
+              TIMESTAMPTZ '2036-08-20T00:00:00Z', 'ON',
+              'synthetic-version-manifest-1', 'COMPLIANCE',
+              TIMESTAMPTZ '2036-08-20T00:00:00Z', 'ON',
+              TIMESTAMPTZ '2026-08-20T00:02:00Z', 'SUCCESS', NULL,
+              'synthetic_retention_enforcer', '{"exact_version_readback":true}'::jsonb
+            );
+            RESET ROLE
+            """,
+        )
+        self._negative_insert(
+            "false_success_hold_off_rejected",
+            """
+            INSERT INTO bronze_retention_enforcement_evidence (
+              enforcement_evidence_id, retention_assignment_id, bucket_name,
+              object_key, object_kind, object_version_id, data_category,
+              retention_class, retention_policy_version, accepted_storage_at_utc,
+              requested_retention_mode, requested_retain_until_utc,
+              requested_legal_hold_status, observed_object_version_id,
+              observed_retention_mode, observed_retain_until_utc,
+              observed_legal_hold_status, enforcement_verified_at_utc,
+              enforcement_verification_result, failure_code, enforced_by
+            ) VALUES (
+              '00000000-0000-7000-8000-000000000527',
+              '00000000-0000-7000-8000-000000000524',
+              'sc-rd-bronze-manifests', 'synthetic/cand-meta/manifest.json',
+              'MANIFEST', 'synthetic-version-manifest-1', 'LAB_NOTE',
+              'permanent', 'smartcoat_retention_2026_08_v1',
+              TIMESTAMPTZ '2026-08-20T00:00:00Z', 'COMPLIANCE',
+              TIMESTAMPTZ '2036-08-20T00:00:00Z', 'ON',
+              'synthetic-version-manifest-1', 'COMPLIANCE',
+              TIMESTAMPTZ '2036-08-20T00:00:00Z', 'OFF',
+              TIMESTAMPTZ '2026-08-20T00:03:00Z', 'SUCCESS', NULL,
+              'synthetic_retention_enforcer'
+            )
+            """,
+            "retention_evidence_result_shape",
+        )
+        self._negative_insert(
+            "duplicate_success_rejected",
+            """
+            INSERT INTO bronze_retention_enforcement_evidence
+            SELECT '00000000-0000-7000-8000-000000000528',
+              retention_assignment_id, bucket_name, object_key, object_kind,
+              object_version_id, data_category, retention_class,
+              retention_policy_version, accepted_storage_at_utc,
+              requested_retention_mode, requested_retain_until_utc,
+              requested_legal_hold_status, observed_object_version_id,
+              observed_retention_mode, observed_retain_until_utc,
+              observed_legal_hold_status, enforcement_verified_at_utc,
+              enforcement_verification_result, failure_code, enforced_by,
+              details_json
+            FROM bronze_retention_enforcement_evidence
+            WHERE enforcement_evidence_id =
+              '00000000-0000-7000-8000-000000000526'
+            """,
+            "bronze_retention_enforcement_one_success",
+        )
+        self._negative_insert(
+            "enforcement_evidence_update_rejected",
+            "UPDATE bronze_retention_enforcement_evidence "
+            "SET enforced_by = 'forbidden'",
+            "append-only",
+        )
+        self._negative_insert(
+            "runtime_evidence_update_rejected",
+            "SET ROLE smartcoat_ingestion; UPDATE bronze_retention_enforcement_evidence "
+            "SET enforced_by = 'forbidden'; RESET ROLE",
+            "permission denied",
+        )
+        for role in ("smartcoat_ocr", "smartcoat_review"):
+            self._negative_insert(
+                f"{role}_evidence_forgery_rejected",
+                f"SET ROLE {role}; INSERT INTO bronze_retention_enforcement_evidence "
+                "SELECT gen_random_uuid(), retention_assignment_id, bucket_name, "
+                "object_key, object_kind, object_version_id, data_category, "
+                "retention_class, retention_policy_version, accepted_storage_at_utc, "
+                "requested_retention_mode, requested_retain_until_utc, "
+                "requested_legal_hold_status, observed_object_version_id, "
+                "observed_retention_mode, observed_retain_until_utc, "
+                "observed_legal_hold_status, enforcement_verified_at_utc, "
+                "enforcement_verification_result, failure_code, enforced_by, "
+                "details_json FROM bronze_retention_enforcement_evidence LIMIT 1; "
+                "RESET ROLE",
+                "permission denied",
+            )
+        self._negative_insert(
+            "backup_evidence_forgery_rejected",
+            "SET ROLE smartcoat_backup; INSERT INTO bronze_retention_enforcement_evidence "
+            "SELECT * FROM bronze_retention_enforcement_evidence LIMIT 1; RESET ROLE",
+            "permission denied",
+        )
+        self._psql_success(
+            "backup_retention_read_succeeds",
+            "SET ROLE smartcoat_backup; SELECT count(*) FROM "
+            "bronze_retention_enforcement_evidence; RESET ROLE",
+        )
         self._negative_insert(
             "policy_update_rejected",
             "UPDATE retention_policy_versions SET approved_by = 'forbidden'",
             "append-only",
+        )
+
+        authority = self._psql_rows(
+            "retention_runtime_authority",
+            """
+            SELECT grantee, table_name, privilege_type
+            FROM information_schema.table_privileges
+            WHERE table_schema = 'public'
+              AND table_name IN (
+                'canonical_retention_classes', 'retention_policy_versions',
+                'retention_category_rules', 'bronze_retention_assignments',
+                'bronze_retention_enforcement_evidence'
+              )
+              AND grantee IN (
+                'smartcoat_app', 'smartcoat_ingestion', 'smartcoat_ocr',
+                'smartcoat_review', 'smartcoat_backup'
+              )
+            ORDER BY grantee, table_name, privilege_type
+            """,
+        )
+        expected_authority = sorted(
+            [
+                {
+                    "grantee": "smartcoat_backup",
+                    "table_name": table,
+                    "privilege_type": "SELECT",
+                }
+                for table in (
+                    "canonical_retention_classes",
+                    "retention_policy_versions",
+                    "retention_category_rules",
+                    "bronze_retention_assignments",
+                    "bronze_retention_enforcement_evidence",
+                )
+            ]
+            + [
+                {
+                    "grantee": "smartcoat_ingestion",
+                    "table_name": table,
+                    "privilege_type": privilege,
+                }
+                for table in (
+                    "bronze_retention_assignments",
+                    "bronze_retention_enforcement_evidence",
+                )
+                for privilege in ("INSERT", "SELECT")
+            ],
+            key=lambda row: (
+                row["grantee"], row["table_name"], row["privilege_type"]
+            ),
+        )
+        self._require(
+            authority == expected_authority,
+            "Retention runtime table authority differs from the exact split-role matrix",
+        )
+        role_logins = self._psql_rows(
+            "retention_role_login_state",
+            "SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname IN ("
+            "'smartcoat_app', 'smartcoat_ingestion', 'smartcoat_ocr', "
+            "'smartcoat_review', 'smartcoat_backup') ORDER BY rolname",
+        )
+        self._require(
+            role_logins
+            == [
+                {"rolname": "smartcoat_app", "rolcanlogin": False},
+                {"rolname": "smartcoat_backup", "rolcanlogin": True},
+                {"rolname": "smartcoat_ingestion", "rolcanlogin": True},
+                {"rolname": "smartcoat_ocr", "rolcanlogin": True},
+                {"rolname": "smartcoat_review", "rolcanlogin": True},
+            ],
+            "Legacy or workflow role login state differs from M0-R02",
         )
 
         ledger = self._psql_rows(
@@ -453,12 +708,12 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
             "ORDER BY version",
         )
         self._require(
-            len(ledger) == 2
-            and ledger[1] == {
-                "version": 5,
-                "name": "expand_retention_metadata",
-                "sha256": candidate_sha,
-            },
+            len(ledger) == 7
+            and [row["version"] for row in ledger] == list(range(1, 8))
+            and all(
+                ledger[version - 1]["sha256"] == candidate_hashes[version]
+                for version in range(2, 8)
+            ),
             "Candidate migration ledger identity is wrong",
         )
         self._require(
@@ -473,13 +728,16 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
         self._verify_owned_resources()
         self.evidence.update(
             {
-                "candidate_migration": {
-                    "version": 5,
-                    "name": "expand_retention_metadata",
-                    "sha256": candidate_sha,
-                    "applied_exactly_once": True,
-                    "idempotent_reapply": True,
-                },
+                "candidate_migrations": [
+                    {
+                        "version": version,
+                        "name": CANDIDATE_MIGRATIONS[version - 2].stem[6:],
+                        "sha256": candidate_hashes[version],
+                    }
+                    for version in range(2, 8)
+                ],
+                "applied_exactly_once": True,
+                "idempotent_reapply": True,
                 "legacy_rows_before": len(legacy_before),
                 "legacy_rows_after": len(legacy_after),
                 "legacy_rows_equal": legacy_before == legacy_after,
@@ -492,11 +750,21 @@ class MetadataScenario(lifecycle.LiveMigrationLifecycleAcceptance):
                     "arbitrary_deadline",
                     "fractional_storage_anchor",
                     "assignment_update",
+                    "false_success_hold_off",
+                    "duplicate_success",
+                    "enforcement_evidence_update",
+                    "runtime_evidence_update",
+                    "smartcoat_ocr_evidence_forgery",
+                    "smartcoat_review_evidence_forgery",
+                    "backup_evidence_forgery",
                     "policy_update",
                 ],
                 "python_database_rules_equal": database_rules == python_rules,
                 "deadline_semantics": deadlines[0],
                 "valid_exact_version_assignments": 1,
+                "valid_exact_version_enforcement_successes": 1,
+                "retention_authority_matrix": authority,
+                "legacy_shared_role_login": False,
                 "migration_advisory_lock_rows": 0,
             }
         )
@@ -545,7 +813,10 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "classification": overall,
                 "accepted_lifecycle_sha256": EXPECTED_LIFECYCLE_SHA256,
-                "candidate_source_sha256": sha256(CANDIDATE_MIGRATION),
+                "candidate_source_sha256": {
+                    migration.name: sha256(migration)
+                    for migration in CANDIDATE_MIGRATIONS
+                },
                 "scenarios": scenarios,
             },
             indent=2,

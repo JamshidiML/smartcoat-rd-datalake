@@ -133,6 +133,48 @@ class RuntimeRoleContractTests(unittest.TestCase):
             self.assertIn(f"CREATE TRIGGER {trigger}", init_sql)
         self.assertNotRegex(MIGRATION.read_text(), r"(?i)DROP\s+TRIGGER|DISABLE\s+TRIGGER")
 
+    def test_retention_tables_extend_the_exact_runtime_privilege_shape(self) -> None:
+        self.assertEqual(
+            {
+                "canonical_retention_classes",
+                "retention_policy_versions",
+                "retention_category_rules",
+                "bronze_retention_assignments",
+                "bronze_retention_enforcement_evidence",
+            },
+            set(rbac_contract.RETENTION_TABLES),
+        )
+        retention_privileges = {
+            item
+            for item in rbac_contract.TABLE_PRIVILEGES
+            if item[1] in rbac_contract.RETENTION_TABLES
+        }
+        expected = {
+            *(('smartcoat_backup', table, 'SELECT')
+              for table in rbac_contract.RETENTION_TABLES),
+            ('smartcoat_ingestion', 'bronze_retention_assignments', 'SELECT'),
+            ('smartcoat_ingestion', 'bronze_retention_assignments', 'INSERT'),
+            (
+                'smartcoat_ingestion',
+                'bronze_retention_enforcement_evidence',
+                'SELECT',
+            ),
+            (
+                'smartcoat_ingestion',
+                'bronze_retention_enforcement_evidence',
+                'INSERT',
+            ),
+        }
+        self.assertEqual(expected, retention_privileges)
+        for role in ("smartcoat_ocr", "smartcoat_review"):
+            self.assertFalse(any(item[0] == role for item in retention_privileges))
+        self.assertFalse(
+            any(
+                item[1] in rbac_contract.RETENTION_TABLES
+                for item in rbac_contract.COLUMN_UPDATE_PRIVILEGES
+            )
+        )
+
 
 class CredentialProvisioningBoundaryTests(unittest.TestCase):
     def test_admin_url_is_explicit_and_database_url_is_not_a_fallback(self) -> None:

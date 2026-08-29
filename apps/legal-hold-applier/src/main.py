@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from http import HTTPStatus
@@ -23,6 +24,16 @@ def required_environment(name: str) -> str:
     return value
 
 
+def required_call_token() -> str:
+    value = required_environment("LEGAL_HOLD_APPLIER_CALL_TOKEN")
+    if len(value) < 32 or "\n" in value or "\x00" in value:
+        raise RuntimeError(
+            "LEGAL_HOLD_APPLIER_CALL_TOKEN must be a single-line value "
+            "of at least 32 characters"
+        )
+    return value
+
+
 def secure_transport() -> bool:
     value = os.environ.get("MINIO_HOLD_APPLIER_SECURE", "false").lower()
     if value not in {"true", "false"}:
@@ -36,6 +47,7 @@ CLIENT = Minio(
     secret_key=required_environment("MINIO_HOLD_APPLIER_SECRET_KEY"),
     secure=secure_transport(),
 )
+CALL_TOKEN = required_call_token()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -59,8 +71,17 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(HTTPStatus.NOT_FOUND, {"classification": "REQUEST_REJECTED"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/apply":
+        if self.path not in {"/apply", "/status"}:
             self.respond(HTTPStatus.NOT_FOUND, {"classification": "REQUEST_REJECTED"})
+            return
+        authorization = self.headers.get("Authorization", "")
+        scheme, separator, presented = authorization.partition(" ")
+        candidate = presented if scheme == "Bearer" and separator else ""
+        if not hmac.compare_digest(candidate, CALL_TOKEN):
+            self.respond(
+                HTTPStatus.UNAUTHORIZED,
+                {"classification": "CALLER_AUTHENTICATION_REQUIRED"},
+            )
             return
         try:
             length = int(self.headers.get("Content-Length", ""))
@@ -71,9 +92,10 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.BAD_REQUEST, {"classification": "REQUEST_REJECTED"})
             return
         try:
-            CLIENT.enable_object_legal_hold(
-                target.bucket, target.object_key, version_id=target.version_id
-            )
+            if self.path == "/apply":
+                CLIENT.enable_object_legal_hold(
+                    target.bucket, target.object_key, version_id=target.version_id
+                )
             observed = CLIENT.is_object_legal_hold_enabled(
                 target.bucket, target.object_key, version_id=target.version_id
             )
@@ -83,7 +105,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"classification": "LEGAL_HOLD_APPLY_FAILED"},
             )
             return
-        if observed is not LEGAL_HOLD_ON:
+        if self.path == "/apply" and observed is not LEGAL_HOLD_ON:
             self.respond(
                 HTTPStatus.CONFLICT,
                 {"classification": "LEGAL_HOLD_READBACK_FAILED"},
@@ -92,11 +114,15 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(
             HTTPStatus.OK,
             {
-                "classification": "LEGAL_HOLD_APPLIED",
+                "classification": (
+                    "LEGAL_HOLD_APPLIED"
+                    if self.path == "/apply"
+                    else "LEGAL_HOLD_STATUS_OBSERVED"
+                ),
                 "bucket": target.bucket,
                 "object_key": target.object_key,
                 "version_id": target.version_id,
-                "legal_hold": "ON",
+                "legal_hold": "ON" if observed else "OFF",
             },
         )
 

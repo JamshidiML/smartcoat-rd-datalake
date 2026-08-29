@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -10,6 +11,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 MINIO = ROOT / "infra" / "minio"
 APPLIER = ROOT / "apps" / "legal-hold-applier" / "src"
+
+
+def compose_service(compose: str, name: str) -> str:
+    start = compose.index(f"  {name}:")
+    following = re.search(r"(?m)^  [a-z][a-z0-9-]*:$", compose[start + 1 :])
+    end = start + 1 + following.start() if following else len(compose)
+    return compose[start:end]
 
 
 def load_contract():
@@ -125,16 +133,36 @@ class RuntimeBoundaryTests(unittest.TestCase):
         self.assertNotIn("ports:", service)
         self.assertIn('expose: ["8090"]', service)
 
+    def test_caller_token_is_constant_time_and_confined_to_api_and_mediator(self) -> None:
+        source = (APPLIER / "main.py").read_text()
+        self.assertIn("hmac.compare_digest(candidate, CALL_TOKEN)", source)
+        self.assertLess(
+            source.index("hmac.compare_digest(candidate, CALL_TOKEN)"),
+            source.index("self.rfile.read(length)"),
+        )
+        compose = (ROOT / "compose.yaml").read_text()
+        services = {
+            name: compose_service(compose, name)
+            for name in (
+                "minio-bootstrap", "legal-hold-applier", "postgres-migrate",
+                "postgres-role-provision", "api", "web", "ocr-worker",
+            )
+        }
+        for name in ("legal-hold-applier", "api"):
+            self.assertIn("LEGAL_HOLD_APPLIER_CALL_TOKEN", services[name])
+        for name in (
+            "minio-bootstrap", "postgres-migrate", "postgres-role-provision",
+            "web", "ocr-worker",
+        ):
+            self.assertNotIn("LEGAL_HOLD_APPLIER_CALL_TOKEN", services[name])
+
     def test_mediator_secret_is_not_injected_into_ordinary_services(self) -> None:
         compose = (ROOT / "compose.yaml").read_text()
         self.assertEqual(compose.count("MINIO_HOLD_APPLIER_SECRET_KEY"), 6)
         for service_name in ("api", "ocr-worker", "web"):
-            start = compose.index(f"  {service_name}:")
-            candidates = [
-                index for index in (compose.find("\n  ", start + 3), len(compose)) if index != -1
-            ]
-            service = compose[start:min(candidates)]
-            self.assertNotIn("MINIO_HOLD_APPLIER", service)
+            service = compose_service(compose, service_name)
+            self.assertNotIn("MINIO_HOLD_APPLIER_ACCESS_KEY", service)
+            self.assertNotIn("MINIO_HOLD_APPLIER_SECRET_KEY", service)
 
     def test_pinned_runtime_and_sdk_are_unchanged(self) -> None:
         compose = (ROOT / "compose.yaml").read_text()
@@ -160,4 +188,4 @@ class RuntimeBoundaryTests(unittest.TestCase):
     def test_live_harness_is_explicitly_opt_in(self) -> None:
         source = (MINIO / "tests" / "live_legal_hold_mediation_acceptance.py").read_text()
         self.assertIn("--confirm-disposable-synthetic-legal-hold-mediation-run", source)
-        self.assertIn("PASS_LEGAL_HOLD_AUTHORITY_READY", source)
+        self.assertIn("PASS_LEGAL_HOLD_CALLER_AUTH_REMEDIATION", source)
