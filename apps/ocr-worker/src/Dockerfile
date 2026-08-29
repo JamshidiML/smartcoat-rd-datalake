@@ -15,7 +15,8 @@ COPY requirements.txt /worker/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 RUN FLAGS_enable_pir_api=0 python -c "from paddleocr import PaddleOCR; PaddleOCR(lang='german', device='cpu', use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, enable_mkldnn=True)"
 ENV FLAGS_enable_pir_api=0
-COPY --from=api-source database.py domain.py identifiers.py storage.py validation.py /worker/
+COPY --from=api-source database.py domain.py identifiers.py retention_enforcement.py \
+    retention_policy.py storage.py validation.py /worker/
 COPY . /worker
 RUN useradd --create-home --uid 10002 worker \
     && chown -R worker:worker /worker /opt/paddle-home /opt/paddle-models

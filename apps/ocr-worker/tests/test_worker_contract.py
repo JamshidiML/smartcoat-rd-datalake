@@ -21,6 +21,11 @@ class WorkerContractTests(unittest.TestCase):
         self.assertIn("api-source: ./apps/api/src", compose)
         self.assertNotIn("context: .\n", compose)
 
+    def test_worker_image_copies_domain_runtime_dependencies(self) -> None:
+        dockerfile = (ROOT / "apps/ocr-worker/src/Dockerfile").read_text()
+        self.assertIn("retention_enforcement.py", dockerfile)
+        self.assertIn("retention_policy.py", dockerfile)
+
     def test_tesseract_uses_same_preprocessed_images(self) -> None:
         worker = (ROOT / "apps/ocr-worker/src/jobs/worker.py").read_text()
         self.assertIn("PADDLE.extract(images)", worker)

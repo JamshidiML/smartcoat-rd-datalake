@@ -205,6 +205,13 @@ GRANT SELECT, INSERT ON TABLE
     bronze_reconciliation_events
 TO smartcoat_ingestion;
 
+-- OCR resolves its queued source through the committed pair and reads only the
+-- exact original version. It receives no Bronze write or orphan authority.
+GRANT SELECT ON TABLE
+    bronze_objects,
+    bronze_pairs
+TO smartcoat_ocr;
+
 GRANT SELECT ON TABLE
     bronze_pairs,
     bronze_protected_orphans,

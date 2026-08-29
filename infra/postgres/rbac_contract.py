@@ -97,7 +97,7 @@ TABLE_PRIVILEGES = frozenset(
         )),
         *(("smartcoat_ingestion", table, "INSERT") for table in BRONZE_PAIR_TABLES),
         *(("smartcoat_ocr", table, "SELECT") for table in (
-            "uploads", "ocr_jobs", "ocr_runs"
+            "uploads", "bronze_objects", "bronze_pairs", "ocr_jobs", "ocr_runs"
         )),
         *(("smartcoat_ocr", table, "INSERT") for table in (
             "ocr_runs", "silver_drafts", "audit_events"

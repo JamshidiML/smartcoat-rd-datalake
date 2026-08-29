@@ -63,13 +63,16 @@ class BronzePairMigrationTests(unittest.TestCase):
             self.sql,
             r"GRANT SELECT ON TABLE\s+bronze_pairs,\s+bronze_protected_orphans,\s+bronze_reconciliation_events\s+TO smartcoat_backup",
         )
-        grants = "\n".join(
-            line for line in self.sql.splitlines()
-            if line.strip().startswith("GRANT") or line.strip().startswith("TO smartcoat")
+        self.assertRegex(
+            self.sql,
+            r"GRANT SELECT ON TABLE\s+bronze_objects,\s+bronze_pairs\s+TO smartcoat_ocr",
         )
-        self.assertNotIn("TO smartcoat_ocr", grants)
-        self.assertNotIn("TO smartcoat_review", grants)
-        self.assertNotIn("TO smartcoat_app", grants)
+        self.assertNotRegex(
+            self.sql,
+            r"(?s)GRANT\s+(?:INSERT|UPDATE|DELETE|ALL).*?TO smartcoat_ocr",
+        )
+        self.assertNotIn("TO smartcoat_review", self.sql)
+        self.assertNotIn("TO smartcoat_app", self.sql)
 
     def test_no_storage_atomicity_or_destructive_compensation(self) -> None:
         lowered = self.sql.lower()
@@ -90,6 +93,15 @@ class BronzePairMigrationTests(unittest.TestCase):
             "--confirm-disposable-synthetic-bronze-pair-run",
             LIVE_ACCEPTANCE.read_text(),
         )
+
+    def test_production_image_gate_has_no_candidate_source_bind_mount(self) -> None:
+        source = LIVE_ACCEPTANCE.read_text(encoding="utf-8")
+        self.assertIn("--api-image-id", source)
+        self.assertIn("--ocr-image-id", source)
+        self.assertNotIn("dst=/candidate", source)
+        self.assertIn("PASS_BRONZE_PAIR_PRODUCTION_IMAGE", source)
+        self.assertIn("PASS_BRONZE_PAIR_LOST_EVIDENCE_RECOVERY", source)
+        self.assertIn("PASS_OCR_EXACT_BRONZE_VERSION_SOURCE", source)
 
 
 if __name__ == "__main__":

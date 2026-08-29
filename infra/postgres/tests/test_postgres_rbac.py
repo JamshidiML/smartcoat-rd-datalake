@@ -196,11 +196,17 @@ class RuntimeRoleContractTests(unittest.TestCase):
                   for privilege in ("SELECT", "INSERT")),
                 *(("smartcoat_backup", table, "SELECT")
                   for table in rbac_contract.BRONZE_PAIR_TABLES),
+                ("smartcoat_ocr", "bronze_pairs", "SELECT"),
             },
             pair_privileges,
         )
-        for role in ("smartcoat_ocr", "smartcoat_review", "smartcoat_app"):
+        for role in ("smartcoat_review", "smartcoat_app"):
             self.assertFalse(any(item[0] == role for item in pair_privileges))
+        self.assertFalse(any(
+            item[0] == "smartcoat_ocr"
+            and (item[1] != "bronze_pairs" or item[2] != "SELECT")
+            for item in pair_privileges
+        ))
         self.assertFalse(
             any(
                 item[1] in rbac_contract.BRONZE_PAIR_TABLES
