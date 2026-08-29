@@ -22,8 +22,8 @@ class RetentionEnforcementMigrationTests(unittest.TestCase):
         import migrate
 
         discovered = migrate.discover_migrations(ROOT / "infra/postgres/migrations")
-        self.assertEqual([1, 2, 3, 4, 5, 6, 7], [item.version for item in discovered])
-        candidate = discovered[-1]
+        self.assertEqual([1, 2, 3, 4, 5, 6, 7, 8], [item.version for item in discovered])
+        candidate = {item.version: item for item in discovered}[7]
         self.assertEqual(7, candidate.version)
         self.assertEqual("record_retention_enforcement_evidence", candidate.name)
 

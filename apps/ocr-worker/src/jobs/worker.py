@@ -49,9 +49,10 @@ def process_job(job: dict[str, object], service: OCRDomainService, storage: Mini
     global PADDLE
     ingestion_id = str(job["ingestion_id"])
     source_key = str(job["stored_object_key"])
+    source_version_id = str(job["original_object_version_id"])
     mime_type = str(job["detected_mime_type"])
     extension = mimetypes.guess_extension(mime_type) or ".bin"
-    source_bytes = storage.get(ORIGINALS_BUCKET, source_key)
+    source_bytes = storage.get_exact(ORIGINALS_BUCKET, source_key, source_version_id)
 
     if str(job["declared_file_type"]) == "EXCEL":
         configuration = {"engine": "openpyxl", "tesseract_benchmark": "not-applicable"}

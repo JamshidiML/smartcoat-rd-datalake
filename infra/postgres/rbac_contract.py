@@ -71,7 +71,13 @@ RETENTION_TABLES = (
     "bronze_retention_enforcement_evidence",
 )
 
-PUBLIC_TABLES = CORE_PUBLIC_TABLES + RETENTION_TABLES
+BRONZE_PAIR_TABLES = (
+    "bronze_pairs",
+    "bronze_protected_orphans",
+    "bronze_reconciliation_events",
+)
+
+PUBLIC_TABLES = CORE_PUBLIC_TABLES + RETENTION_TABLES + BRONZE_PAIR_TABLES
 
 TABLE_PRIVILEGES = frozenset(
     {
@@ -82,12 +88,14 @@ TABLE_PRIVILEGES = frozenset(
             "bronze_retention_assignments",
             "bronze_retention_enforcement_evidence",
         )),
+        *(("smartcoat_ingestion", table, "SELECT") for table in BRONZE_PAIR_TABLES),
         *(("smartcoat_backup", table, "SELECT") for table in PUBLIC_TABLES),
         *(("smartcoat_ingestion", table, "INSERT") for table in (
             "users", "uploads", "bronze_objects", "ocr_jobs", "audit_events",
             "bronze_retention_assignments",
             "bronze_retention_enforcement_evidence",
         )),
+        *(("smartcoat_ingestion", table, "INSERT") for table in BRONZE_PAIR_TABLES),
         *(("smartcoat_ocr", table, "SELECT") for table in (
             "uploads", "ocr_jobs", "ocr_runs"
         )),
@@ -148,6 +156,7 @@ PROTECTED_APPEND_ONLY_TABLES = (
     "review_decisions",
     "audit_events",
     *RETENTION_TABLES,
+    *BRONZE_PAIR_TABLES,
 )
 
 ROLE_ATTRIBUTE_QUERY = """

@@ -15,7 +15,7 @@ from domain import (  # noqa: E402
     ReviewService,
     StateConflict,
 )
-from fakes import MemoryRepository, MemoryStorage  # noqa: E402
+from fakes import MemoryRepository, MemoryRetentionEnforcer, MemoryStorage  # noqa: E402
 
 
 STATES = (
@@ -93,7 +93,10 @@ class StateTransitionServiceBoundaryTests(unittest.TestCase):
     def test_ingestion_ocr_review_and_revision_use_only_legal_edges(self) -> None:
         repository = GraphEnforcingMemoryRepository()
         actor = Actor("usr_m0r03", "M0 R03 Synthetic Reviewer")
-        ingestion = IngestionService(repository, MemoryStorage(), 1024 * 1024)
+        ingestion = IngestionService(
+            repository, MemoryStorage(), 1024 * 1024,
+            MemoryRetentionEnforcer(),
+        )
         upload = ingestion.ingest(
             actor,
             "m0-r03-synthetic.jpg",

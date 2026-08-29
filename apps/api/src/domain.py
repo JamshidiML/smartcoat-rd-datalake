@@ -7,6 +7,12 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from identifiers import uuid7
+from retention_enforcement import ExactVersionTarget, RetentionEnforcementEvidence
+from retention_policy import (
+    RETENTION_POLICY_VERSION,
+    RetentionPolicyError,
+    resolve_category_rule,
+)
 from validation import UploadValidationError, validate_upload
 
 
@@ -37,7 +43,30 @@ class Repository(Protocol):
 
     def create_received(self, upload: dict[str, Any]) -> None: ...
 
-    def commit_bronze(self, upload: dict[str, Any], objects: list[dict[str, Any]]) -> None: ...
+    def commit_bronze_pair(
+        self,
+        upload: dict[str, Any],
+        members: list[dict[str, Any]],
+        pair: dict[str, Any],
+    ) -> None: ...
+
+    def record_protected_orphans(
+        self,
+        upload: dict[str, Any],
+        members: list[dict[str, Any]],
+        failure_stage: str,
+        failure_code: str,
+    ) -> None: ...
+
+    def bronze_reconciliation_context(self, ingestion_id: str) -> dict[str, Any]: ...
+
+    def record_reconciliation(
+        self,
+        ingestion_id: str,
+        retry_identity_sha256: str,
+        outcome: str,
+        details: dict[str, Any],
+    ) -> None: ...
 
     def transition(
         self,
@@ -48,7 +77,7 @@ class Repository(Protocol):
         details: dict[str, Any] | None = None,
     ) -> None: ...
 
-    def queue_ocr(self, ingestion_id: str) -> str: ...
+    def ensure_ocr_queued(self, ingestion_id: str) -> str: ...
 
     def get_upload(self, ingestion_id: str) -> dict[str, Any]: ...
 
@@ -72,7 +101,22 @@ class Repository(Protocol):
 class ObjectStorage(Protocol):
     def put_once(self, bucket: str, key: str, data: bytes, content_type: str, locked: bool) -> dict[str, Any]: ...
 
-    def get(self, bucket: str, key: str) -> bytes: ...
+    def get_exact(self, bucket: str, key: str, version_id: str) -> bytes: ...
+
+    def list_exact_versions(self, bucket: str, key: str) -> list[str]: ...
+
+
+class RetentionEnforcer(Protocol):
+    def enforce(
+        self,
+        *,
+        target: ExactVersionTarget,
+        retention_assignment_id: str,
+        data_category: str,
+        retention_class: str,
+        retention_policy_version: str,
+        enforced_by: str,
+    ) -> RetentionEnforcementEvidence: ...
 
 
 @dataclass(frozen=True)
@@ -86,10 +130,164 @@ def utc_now() -> datetime:
 
 
 class IngestionService:
-    def __init__(self, repository: Repository, storage: ObjectStorage, max_upload_bytes: int) -> None:
+    def __init__(
+        self,
+        repository: Repository,
+        storage: ObjectStorage,
+        max_upload_bytes: int,
+        retention_enforcer: RetentionEnforcer,
+    ) -> None:
         self.repository = repository
         self.storage = storage
         self.max_upload_bytes = max_upload_bytes
+        self.retention_enforcer = retention_enforcer
+
+    @staticmethod
+    def _member(
+        *,
+        bucket: str,
+        key: str,
+        kind: str,
+        digest: str,
+        version_id: Any,
+        evidence: RetentionEnforcementEvidence,
+    ) -> dict[str, Any]:
+        if not isinstance(version_id, str) or not version_id.strip():
+            raise StateConflict(f"{kind} upload did not return an exact version ID")
+        if evidence.object_version_id != version_id:
+            raise StateConflict(f"{kind} protection targeted a different object version")
+        return {
+            "bucket": bucket,
+            "key": key,
+            "kind": kind,
+            "sha256": digest,
+            "version_id": version_id,
+            "retention_assignment_id": evidence.retention_assignment_id,
+            "retention": evidence.as_record(),
+        }
+
+    def _protect_member(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        kind: str,
+        digest: str,
+        version_id: Any,
+        document_category: str,
+    ) -> dict[str, Any]:
+        if not isinstance(version_id, str) or not version_id.strip():
+            raise StateConflict(f"{kind} upload did not return an exact version ID")
+        rule = resolve_category_rule(document_category)
+        assignment_id = uuid7()
+        evidence = self.retention_enforcer.enforce(
+            target=ExactVersionTarget(bucket, key, version_id, kind),
+            retention_assignment_id=assignment_id,
+            data_category=rule.data_category,
+            retention_class=rule.retention_class,
+            retention_policy_version=RETENTION_POLICY_VERSION,
+            enforced_by="ingestion-service",
+        )
+        stored = self.storage.get_exact(bucket, key, version_id)
+        if hashlib.sha256(stored).hexdigest() != digest:
+            raise StateConflict(f"Stored Bronze {kind.lower()} failed exact-version SHA-256 verification")
+        return self._member(
+            bucket=bucket,
+            key=key,
+            kind=kind,
+            digest=digest,
+            version_id=version_id,
+            evidence=evidence,
+        )
+
+    @staticmethod
+    def _pair_identity(members: list[dict[str, Any]]) -> str:
+        canonical = [
+            {
+                "bucket": item["bucket"],
+                "key": item["key"],
+                "version_id": item["version_id"],
+                "retention_policy_version": item["retention"]["retention_policy_version"],
+            }
+            for item in sorted(members, key=lambda value: value["kind"])
+        ]
+        return hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _record_orphans(
+        self,
+        upload: dict[str, Any],
+        protected: list[dict[str, Any]],
+        stage: str,
+        exc: Exception,
+    ) -> None:
+        if not protected:
+            return
+        code = getattr(exc, "code", type(exc).__name__)
+        self.repository.record_protected_orphans(
+            upload, protected, stage, str(code)[:200]
+        )
+
+    def _discover_protected_members(
+        self,
+        upload: dict[str, Any],
+        existing: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Recover exact candidates by deterministic key, never latest-key state."""
+
+        discovered = list(existing)
+        known_kinds = {item["kind"] for item in discovered}
+        targets = (
+            ("ORIGINAL", ORIGINALS_BUCKET, upload["stored_object_key"]),
+            ("MANIFEST", MANIFESTS_BUCKET, upload["manifest_object_key"]),
+        )
+        for kind, bucket, key in targets:
+            if kind in known_kinds:
+                continue
+            versions = self.storage.list_exact_versions(bucket, key)
+            if not versions:
+                continue
+            if len(versions) != 1:
+                raise StateConflict(
+                    f"Protected Bronze {kind.lower()} discovery is ambiguous"
+                )
+            version_id = versions[0]
+            content = self.storage.get_exact(bucket, key, version_id)
+            digest = hashlib.sha256(content).hexdigest()
+            if kind == "ORIGINAL" and digest != upload["sha256"]:
+                raise StateConflict("Discovered original does not match upload SHA-256")
+            if kind == "MANIFEST":
+                try:
+                    manifest = json.loads(content)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise StateConflict("Discovered manifest is not canonical JSON") from exc
+                original_version_id = next(
+                    (
+                        member["version_id"]
+                        for member in discovered
+                        if member["kind"] == "ORIGINAL"
+                    ),
+                    None,
+                )
+                if (
+                    manifest.get("ingestion_id") != str(upload["ingestion_id"])
+                    or manifest.get("stored_object_key") != upload["stored_object_key"]
+                    or manifest.get("sha256") != upload["sha256"]
+                    or manifest.get("original_object_version_id") != original_version_id
+                ):
+                    raise StateConflict("Discovered manifest does not match the ingestion")
+            discovered.append(
+                self._protect_member(
+                    bucket=bucket,
+                    key=key,
+                    kind=kind,
+                    digest=digest,
+                    version_id=version_id,
+                    document_category=upload["document_category"],
+                )
+            )
+        return discovered
 
     def ingest(
         self,
@@ -113,6 +311,21 @@ class IngestionService:
         except UploadValidationError as exc:
             self.repository.record_rejection(ingestion_id, actor.user_id, exc.reason, exc.code)
             raise
+
+        try:
+            resolve_category_rule(document_category)
+        except RetentionPolicyError as exc:
+            reason = "Document category has no approved retention assignment"
+            self.repository.record_rejection(
+                ingestion_id,
+                actor.user_id,
+                reason,
+                "RETENTION_CLASSIFICATION_PENDING",
+            )
+            raise UploadValidationError(
+                reason,
+                "RETENTION_CLASSIFICATION_PENDING",
+            ) from exc
 
         now = utc_now()
         digest = hashlib.sha256(data).hexdigest()
@@ -142,61 +355,139 @@ class IngestionService:
         }
         self.repository.create_received(upload)
 
-        original_result = self.storage.put_once(
-            ORIGINALS_BUCKET, original_key, data, validated.mime_type, locked=True
-        )
-        stored_bytes = self.storage.get(ORIGINALS_BUCKET, original_key)
-        if hashlib.sha256(stored_bytes).hexdigest() != digest:
-            raise StateConflict("Stored Bronze bytes failed SHA-256 verification")
+        protected: list[dict[str, Any]] = []
+        stage = "original_upload"
+        try:
+            original_result = self.storage.put_once(
+                ORIGINALS_BUCKET, original_key, data, validated.mime_type, locked=False
+            )
+            stage = "original_protection"
+            original_member = self._protect_member(
+                bucket=ORIGINALS_BUCKET,
+                key=original_key,
+                kind="ORIGINAL",
+                digest=digest,
+                version_id=original_result.get("version_id"),
+                document_category=document_category,
+            )
+            protected.append(original_member)
 
-        manifest = {
-            "manifest_version": "1.0",
-            "ingestion_id": ingestion_id,
-            "bronze_status": "COMMITTED",
-            "department": "RND",
-            "uploader_user_id": actor.user_id,
-            "uploader_display_name": actor.display_name,
-            "uploaded_at_utc": now.isoformat().replace("+00:00", "Z"),
-            "original_filename": filename,
-            "stored_object_key": original_key,
-            "detected_mime_type": validated.mime_type,
-            "declared_file_type": validated.file_type,
-            "byte_size": len(data),
-            "sha256": digest,
-            "duplicate_of_ingestion_id": duplicate_of,
-            "source_channel": "WEB_UPLOAD",
-            "metadata_schema_version": "1.0",
-        }
-        manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-        manifest_result = self.storage.put_once(
-            MANIFESTS_BUCKET, manifest_key, manifest_bytes, "application/json", locked=True
-        )
-        if self.storage.get(MANIFESTS_BUCKET, manifest_key) != manifest_bytes:
-            raise StateConflict("Stored Bronze manifest failed byte verification")
-
-        self.repository.commit_bronze(
-            upload,
-            [
+            manifest = {
+                "manifest_version": "1.0",
+                "ingestion_id": ingestion_id,
+                "bronze_status": "PAIR_CANDIDATE",
+                "department": "RND",
+                "uploader_user_id": actor.user_id,
+                "uploader_display_name": actor.display_name,
+                "uploaded_at_utc": now.isoformat().replace("+00:00", "Z"),
+                "original_filename": filename,
+                "stored_object_key": original_key,
+                "detected_mime_type": validated.mime_type,
+                "declared_file_type": validated.file_type,
+                "byte_size": len(data),
+                "sha256": digest,
+                "duplicate_of_ingestion_id": duplicate_of,
+                "source_channel": "WEB_UPLOAD",
+                "metadata_schema_version": "1.0",
+                "original_object_version_id": original_member["version_id"],
+                "retention_class": original_member["retention"]["retention_class"],
+                "retention_policy_version": original_member["retention"]["retention_policy_version"],
+            }
+            manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+            manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+            stage = "manifest_upload"
+            manifest_result = self.storage.put_once(
+                MANIFESTS_BUCKET, manifest_key, manifest_bytes, "application/json", locked=False
+            )
+            stage = "manifest_protection"
+            manifest_member = self._protect_member(
+                bucket=MANIFESTS_BUCKET,
+                key=manifest_key,
+                kind="MANIFEST",
+                digest=manifest_digest,
+                version_id=manifest_result.get("version_id"),
+                document_category=document_category,
+            )
+            protected.append(manifest_member)
+            stage = "pair_consistency"
+            policies = {
+                (item["retention"]["retention_class"], item["retention"]["retention_policy_version"])
+                for item in protected
+            }
+            if len(policies) != 1:
+                raise StateConflict("Original and manifest retention policy mismatch")
+            pair_identity = self._pair_identity(protected)
+            stage = "postgres_success_transaction"
+            self.repository.commit_bronze_pair(
+                upload,
+                protected,
                 {
-                    "bucket": ORIGINALS_BUCKET,
-                    "key": original_key,
-                    "sha256": digest,
-                    "version_id": original_result.get("version_id"),
-                    "kind": "ORIGINAL",
+                    "bronze_pair_id": uuid7(),
+                    "pair_identity_sha256": pair_identity,
+                    "retention_class": original_member["retention"]["retention_class"],
+                    "retention_policy_version": original_member["retention"]["retention_policy_version"],
                 },
-                {
-                    "bucket": MANIFESTS_BUCKET,
-                    "key": manifest_key,
-                    "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-                    "version_id": manifest_result.get("version_id"),
-                    "kind": "MANIFEST",
-                },
-            ],
-        )
-        self.repository.transition(ingestion_id, "RECEIVED", "BRONZE_COMMITTED", "system")
-        job_id = self.repository.queue_ocr(ingestion_id)
-        self.repository.transition(ingestion_id, "BRONZE_COMMITTED", "OCR_QUEUED", "system")
+            )
+        except Exception as exc:
+            self._record_orphans(upload, protected, stage, exc)
+            raise
+        job_id = self.repository.ensure_ocr_queued(ingestion_id)
         return {"ingestion_id": ingestion_id, "ocr_job_id": job_id, "manifest": manifest}
+
+    def reconcile(self, ingestion_id: str) -> dict[str, Any]:
+        context = self.repository.bronze_reconciliation_context(ingestion_id)
+        upload = context["upload"]
+        if context.get("pair"):
+            job_id = self.repository.ensure_ocr_queued(ingestion_id)
+            return {"ingestion_id": ingestion_id, "ocr_job_id": job_id, "status": "ALREADY_COMMITTED"}
+        members = list(context.get("orphans", []))
+        if len(members) != 2:
+            discovered = self._discover_protected_members(upload, members)
+            newly_discovered = [
+                item for item in discovered
+                if item["kind"] not in {member["kind"] for member in members}
+            ]
+            if newly_discovered:
+                self.repository.record_protected_orphans(
+                    upload,
+                    newly_discovered,
+                    "reconciliation_exact_version_discovery",
+                    "RECOVERED_AFTER_EVIDENCE_WRITE_FAILURE",
+                )
+                context = self.repository.bronze_reconciliation_context(ingestion_id)
+                members = list(context.get("orphans", []))
+        if len(members) != 2 or {item["kind"] for item in members} != {"ORIGINAL", "MANIFEST"}:
+            raise StateConflict("Protected Bronze pair is incomplete")
+        refreshed: list[dict[str, Any]] = []
+        for item in members:
+            refreshed.append(
+                self._protect_member(
+                    bucket=item["bucket"], key=item["key"], kind=item["kind"],
+                    digest=item["sha256"], version_id=item["version_id"],
+                    document_category=upload["document_category"],
+                )
+            )
+        identity = self._pair_identity(refreshed)
+        if identity != context["retry_identity_sha256"]:
+            self.repository.record_reconciliation(
+                ingestion_id, identity, "CONFLICT", {"expected": context["retry_identity_sha256"]}
+            )
+            raise StateConflict("Stale or conflicting Bronze reconciliation retry")
+        self.repository.commit_bronze_pair(
+            upload,
+            refreshed,
+            {
+                "bronze_pair_id": uuid7(),
+                "pair_identity_sha256": identity,
+                "retention_class": refreshed[0]["retention"]["retention_class"],
+                "retention_policy_version": refreshed[0]["retention"]["retention_policy_version"],
+            },
+        )
+        self.repository.record_reconciliation(
+            ingestion_id, identity, "COMPLETED_PAIR", {"exact_version_readback": True}
+        )
+        job_id = self.repository.ensure_ocr_queued(ingestion_id)
+        return {"ingestion_id": ingestion_id, "ocr_job_id": job_id, "status": "RECONCILED"}
 
 
 class OCRDomainService:

@@ -21,7 +21,7 @@ from domain import (  # noqa: E402
     SOLO_EXCEPTION_REASON,
     StateConflict,
 )
-from fakes import MemoryRepository, MemoryStorage  # noqa: E402
+from fakes import MemoryRepository, MemoryRetentionEnforcer, MemoryStorage  # noqa: E402
 from validation import UploadValidationError  # noqa: E402
 
 
@@ -34,7 +34,10 @@ class AcceptanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repository = MemoryRepository()
         self.storage = MemoryStorage()
-        self.ingestion = IngestionService(self.repository, self.storage, 50 * 1024 * 1024)
+        self.ingestion = IngestionService(
+            self.repository, self.storage, 50 * 1024 * 1024,
+            MemoryRetentionEnforcer(),
+        )
 
     def upload(self, data: bytes = JPEG, filename: str = "synthetic-lab.jpg") -> dict:
         return self.ingestion.ingest(
@@ -163,8 +166,11 @@ class AcceptanceTests(unittest.TestCase):
 
         second_repository = MemoryRepository()
         second_storage = MemoryStorage()
-        result = IngestionService(second_repository, second_storage, 1024 * 1024).ingest(
-            ACTOR, "synthetic.jpg", JPEG, "OTHER", "Synthetic second repository fixture.", None
+        result = IngestionService(
+            second_repository, second_storage, 1024 * 1024,
+            MemoryRetentionEnforcer(),
+        ).ingest(
+            ACTOR, "synthetic.jpg", JPEG, "LAB_NOTE", "Synthetic second repository fixture.", None
         )
         ocr = OCRDomainService(second_repository)
         run_id = ocr.start(result["ingestion_id"], "paddleocr", "3.7.0", {})

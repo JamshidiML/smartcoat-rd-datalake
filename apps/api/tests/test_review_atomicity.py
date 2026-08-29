@@ -18,7 +18,7 @@ from domain import (  # noqa: E402
     ReviewService,
     StateConflict,
 )
-from fakes import MemoryRepository, MemoryStorage  # noqa: E402
+from fakes import MemoryRepository, MemoryRetentionEnforcer, MemoryStorage  # noqa: E402
 
 
 JPEG = b"\xff\xd8\xff\xe0" + b"m0-r04-synthetic-review-source" + b"\xff\xd9"
@@ -40,6 +40,7 @@ class ReviewAtomicityTests(unittest.TestCase):
             self.repository,
             MemoryStorage(),
             1024 * 1024,
+            MemoryRetentionEnforcer(),
         ).ingest(
             ACTOR,
             "m0-r04-synthetic.jpg",

@@ -13,6 +13,11 @@ from pydantic import BaseModel
 
 from database import PostgresRepository
 from domain import Actor, IngestionService, ReviewService, StateConflict
+from retention_enforcement import (
+    ExactVersionRetentionEnforcer,
+    HttpLegalHoldMediator,
+    MinioExactVersionRetentionStorage,
+)
 from security import InvalidSession, issue_session, verify_session
 from storage import MinioObjectStorage
 from validation import UploadValidationError
@@ -38,7 +43,16 @@ minio_client = Minio(
     secure=os.getenv("MINIO_SECURE", "false").lower() == "true",
 )
 storage = MinioObjectStorage(minio_client)
-ingestion_service = IngestionService(repository, storage, MAX_UPLOAD_BYTES)
+retention_enforcer = ExactVersionRetentionEnforcer(
+    MinioExactVersionRetentionStorage(minio_client),
+    HttpLegalHoldMediator(
+        os.environ["LEGAL_HOLD_APPLIER_URL"],
+        os.environ["LEGAL_HOLD_APPLIER_CALL_TOKEN"],
+    ),
+)
+ingestion_service = IngestionService(
+    repository, storage, MAX_UPLOAD_BYTES, retention_enforcer
+)
 review_service = ReviewService(review_repository, ALLOW_SOLO_REVIEW)
 
 
@@ -163,13 +177,29 @@ def uploads(_: Annotated[Actor, Depends(current_actor)]) -> list[dict[str, Any]]
 @app.get("/api/uploads/{ingestion_id}/source")
 def source(ingestion_id: str, _: Annotated[Actor, Depends(current_actor)]) -> Response:
     record = repository.get_upload(ingestion_id)
-    data = storage.get("sc-rd-bronze-originals", record["stored_object_key"])
+    version_id = record.get("original_object_version_id")
+    if not version_id:
+        raise HTTPException(status_code=409, detail="Exact Bronze source version unavailable")
+    data = storage.get_exact(
+        "sc-rd-bronze-originals", record["stored_object_key"], version_id
+    )
     return Response(data, media_type=record["detected_mime_type"], headers={"X-Content-Type-Options": "nosniff"})
 
 
 @app.get("/api/uploads/{ingestion_id}/audit")
 def audit(ingestion_id: str, _: Annotated[Actor, Depends(current_actor)]) -> list[dict[str, Any]]:
     return serializable(repository.audit_events(ingestion_id))
+
+
+@app.post("/api/uploads/{ingestion_id}/reconcile-bronze")
+def reconcile_bronze(
+    ingestion_id: str,
+    _: Annotated[Actor, Depends(current_actor)],
+) -> dict[str, Any]:
+    try:
+        return serializable(ingestion_service.reconcile(ingestion_id))
+    except StateConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/drafts")

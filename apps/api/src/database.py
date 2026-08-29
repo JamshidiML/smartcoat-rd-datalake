@@ -123,35 +123,281 @@ class PostgresRepository:
                 "RECEIVED",
             )
 
-    def commit_bronze(self, upload: dict[str, Any], objects: list[dict[str, Any]]) -> None:
+    def commit_bronze_pair(
+        self,
+        upload: dict[str, Any],
+        members: list[dict[str, Any]],
+        pair: dict[str, Any],
+    ) -> None:
         with self.connection() as connection:
-            for item in objects:
+            existing = connection.execute(
+                """
+                SELECT pair_identity_sha256 FROM bronze_pairs
+                WHERE ingestion_id = %s
+                """,
+                (upload["ingestion_id"],),
+            ).fetchone()
+            if existing:
+                if existing["pair_identity_sha256"] != pair["pair_identity_sha256"]:
+                    raise StateConflict("Conflicting successful Bronze pair")
+                return
+
+            object_ids: dict[str, str] = {}
+            for item in members:
+                bronze_object_id = uuid7()
                 connection.execute(
                     """
                     INSERT INTO bronze_objects (
                         bronze_object_id, ingestion_id, bucket_name, object_key, object_kind,
                         sha256, object_version_id, retention_mode, retain_until_utc, created_at_utc
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'COMPLIANCE', now() + interval '365 days', now())
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'COMPLIANCE', %s, %s)
                     """,
                     (
-                        uuid7(),
+                        bronze_object_id,
                         upload["ingestion_id"],
                         item["bucket"],
                         item["key"],
                         item["kind"],
                         item["sha256"],
                         item["version_id"],
+                        item["retention"]["observed_retain_until_utc"],
+                        item["retention"]["accepted_storage_at_utc"],
                     ),
                 )
+                object_ids[item["kind"]] = bronze_object_id
+                evidence = item["retention"]
+                assignment = {
+                    "retention_assignment_id": item["retention_assignment_id"],
+                    "bronze_object_id": bronze_object_id,
+                    "ingestion_id": upload["ingestion_id"],
+                    "bucket_name": item["bucket"],
+                    "object_key": item["key"],
+                    "object_kind": item["kind"],
+                    "object_version_id": item["version_id"],
+                    "data_category": evidence["data_category"],
+                    "retention_class": evidence["retention_class"],
+                    "retention_policy_version": evidence["retention_policy_version"],
+                    "retention_assigned_at_utc": evidence["enforcement_verified_at_utc"],
+                    "retention_assigned_by": evidence["enforced_by"],
+                    "accepted_storage_at_utc": evidence["accepted_storage_at_utc"],
+                    "expected_retain_until_utc": evidence["requested_retain_until_utc"],
+                    "legal_hold_required": evidence["requested_legal_hold_status"] == "ON",
+                }
+                self._insert_retention_evidence(connection, assignment, evidence)
+
+            if set(object_ids) != {"ORIGINAL", "MANIFEST"}:
+                raise StateConflict("Successful Bronze commit requires exactly one original and manifest")
+            connection.execute(
+                """
+                INSERT INTO bronze_pairs (
+                    bronze_pair_id, ingestion_id, original_bronze_object_id,
+                    manifest_bronze_object_id, pair_identity_sha256,
+                    retention_class, retention_policy_version, committed_at_utc,
+                    committed_by
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, now(), 'ingestion-service')
+                """,
+                (
+                    pair["bronze_pair_id"], upload["ingestion_id"],
+                    object_ids["ORIGINAL"], object_ids["MANIFEST"],
+                    pair["pair_identity_sha256"], pair["retention_class"],
+                    pair["retention_policy_version"],
+                ),
+            )
+            transitioned = connection.execute(
+                "UPDATE uploads SET state = 'BRONZE_COMMITTED' WHERE ingestion_id = %s AND state = 'RECEIVED'",
+                (upload["ingestion_id"],),
+            )
+            if transitioned.rowcount != 1:
+                raise StateConflict("Bronze pair cannot commit from the current upload state")
             self._audit(
                 connection,
                 "system",
                 "UPLOAD",
                 upload["ingestion_id"],
-                "BRONZE_OBJECTS_VERIFIED",
+                "BRONZE_PAIR_COMMITTED",
                 "RECEIVED",
-                "RECEIVED",
-                {"object_count": len(objects)},
+                "BRONZE_COMMITTED",
+                {
+                    "bronze_pair_id": pair["bronze_pair_id"],
+                    "pair_identity_sha256": pair["pair_identity_sha256"],
+                    "object_count": 2,
+                },
+            )
+
+    def _insert_retention_evidence(
+        self,
+        connection: psycopg.Connection[Any],
+        assignment: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO bronze_retention_assignments (
+                retention_assignment_id, bronze_object_id, ingestion_id,
+                bucket_name, object_key, object_kind, object_version_id,
+                data_category, retention_class, retention_policy_version,
+                retention_assigned_at_utc, retention_assigned_by,
+                accepted_storage_at_utc, expected_retain_until_utc,
+                legal_hold_required
+            ) VALUES (
+                %(retention_assignment_id)s, %(bronze_object_id)s,
+                %(ingestion_id)s, %(bucket_name)s, %(object_key)s,
+                %(object_kind)s, %(object_version_id)s, %(data_category)s,
+                %(retention_class)s, %(retention_policy_version)s,
+                %(retention_assigned_at_utc)s, %(retention_assigned_by)s,
+                %(accepted_storage_at_utc)s,
+                retention_deadline_utc(
+                    %(retention_class)s, %(accepted_storage_at_utc)s
+                ),
+                %(legal_hold_required)s
+            )
+            """,
+            assignment,
+        )
+        parameters = {
+            **evidence,
+            "enforcement_evidence_id": uuid7(),
+            "details_json": self._json(evidence.get("details_json", {})),
+        }
+        connection.execute(
+            """
+            INSERT INTO bronze_retention_enforcement_evidence (
+                enforcement_evidence_id, retention_assignment_id,
+                bucket_name, object_key, object_kind, object_version_id,
+                data_category, retention_class, retention_policy_version,
+                accepted_storage_at_utc, requested_retention_mode,
+                requested_retain_until_utc, requested_legal_hold_status,
+                observed_object_version_id, observed_retention_mode,
+                observed_retain_until_utc, observed_legal_hold_status,
+                enforcement_verified_at_utc, enforcement_verification_result,
+                failure_code, enforced_by, details_json
+            ) VALUES (
+                %(enforcement_evidence_id)s, %(retention_assignment_id)s,
+                %(bucket_name)s, %(object_key)s, %(object_kind)s,
+                %(object_version_id)s, %(data_category)s,
+                %(retention_class)s, %(retention_policy_version)s,
+                %(accepted_storage_at_utc)s, %(requested_retention_mode)s,
+                %(requested_retain_until_utc)s, %(requested_legal_hold_status)s,
+                %(observed_object_version_id)s, %(observed_retention_mode)s,
+                %(observed_retain_until_utc)s, %(observed_legal_hold_status)s,
+                %(enforcement_verified_at_utc)s,
+                %(enforcement_verification_result)s, %(failure_code)s,
+                %(enforced_by)s, %(details_json)s::jsonb
+            )
+            """,
+            parameters,
+        )
+
+    def record_protected_orphans(
+        self,
+        upload: dict[str, Any],
+        members: list[dict[str, Any]],
+        failure_stage: str,
+        failure_code: str,
+    ) -> None:
+        with self.connection() as connection:
+            for item in members:
+                evidence = item["retention"]
+                connection.execute(
+                    """
+                    INSERT INTO bronze_protected_orphans (
+                        protected_orphan_id, ingestion_id, bucket_name,
+                        object_key, object_kind, object_version_id, sha256,
+                        retention_class, retention_policy_version,
+                        observed_retention_mode, observed_retain_until_utc,
+                        observed_legal_hold_status, protection_verified_at_utc,
+                        failure_stage, failure_code, discovered_at_utc,
+                        discovered_by, details_json
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, now(), 'ingestion-service', %s::jsonb
+                    )
+                    ON CONFLICT (
+                        ingestion_id, bucket_name, object_key,
+                        object_version_id, retention_policy_version
+                    ) DO NOTHING
+                    """,
+                    (
+                        uuid7(), upload["ingestion_id"], item["bucket"], item["key"],
+                        item["kind"], item["version_id"], item["sha256"],
+                        evidence["retention_class"], evidence["retention_policy_version"],
+                        evidence["observed_retention_mode"],
+                        evidence["observed_retain_until_utc"],
+                        evidence["observed_legal_hold_status"],
+                        evidence["enforcement_verified_at_utc"], failure_stage,
+                        failure_code, self._json({"protected_orphan": True}),
+                    ),
+                )
+            self._audit(
+                connection, "system", "UPLOAD", upload["ingestion_id"],
+                "PROTECTED_ORPHAN_RECORDED", "RECEIVED", "RECEIVED",
+                {"member_count": len(members), "failure_stage": failure_stage,
+                 "failure_code": failure_code},
+            )
+
+    def bronze_reconciliation_context(self, ingestion_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            upload = connection.execute(
+                "SELECT * FROM uploads WHERE ingestion_id = %s", (ingestion_id,)
+            ).fetchone()
+            if not upload:
+                raise KeyError(ingestion_id)
+            pair = connection.execute(
+                "SELECT * FROM bronze_pairs WHERE ingestion_id = %s", (ingestion_id,)
+            ).fetchone()
+            rows = connection.execute(
+                """
+                SELECT bucket_name AS bucket, object_key AS key,
+                    object_kind AS kind, object_version_id AS version_id,
+                    sha256, retention_policy_version
+                FROM bronze_protected_orphans
+                WHERE ingestion_id = %s
+                ORDER BY object_kind
+                """,
+                (ingestion_id,),
+            ).fetchall()
+            orphans = [dict(row) for row in rows]
+            identity = None
+            if orphans:
+                canonical = [
+                    {key: row[key] for key in (
+                        "bucket", "key", "version_id", "retention_policy_version"
+                    )}
+                    for row in orphans
+                ]
+                import hashlib
+                identity = hashlib.sha256(
+                    json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            result_upload = dict(upload)
+            result_upload["sha256"] = result_upload["source_sha256"]
+            return {
+                "upload": result_upload,
+                "pair": dict(pair) if pair else None,
+                "orphans": orphans,
+                "retry_identity_sha256": identity,
+            }
+
+    def record_reconciliation(
+        self,
+        ingestion_id: str,
+        retry_identity_sha256: str,
+        outcome: str,
+        details: dict[str, Any],
+    ) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO bronze_reconciliation_events (
+                    reconciliation_event_id, ingestion_id,
+                    retry_identity_sha256, outcome, occurred_at_utc,
+                    actor, details_json
+                ) VALUES (%s, %s, %s, %s, now(), 'ingestion-service', %s::jsonb)
+                ON CONFLICT (ingestion_id, retry_identity_sha256, outcome)
+                DO NOTHING
+                """,
+                (uuid7(), ingestion_id, retry_identity_sha256, outcome,
+                 self._json(details)),
             )
 
     def record_retention_enforcement(
@@ -308,9 +554,21 @@ class PostgresRepository:
                 details,
             )
 
-    def queue_ocr(self, ingestion_id: str) -> str:
+    def ensure_ocr_queued(self, ingestion_id: str) -> str:
         job_id = uuid7()
         with self.connection() as connection:
+            upload = connection.execute(
+                "SELECT state FROM uploads WHERE ingestion_id = %s FOR UPDATE",
+                (ingestion_id,),
+            ).fetchone()
+            if not upload or upload["state"] not in {"BRONZE_COMMITTED", "OCR_QUEUED"}:
+                raise StateConflict("OCR cannot be queued before a successful Bronze pair commit")
+            existing = connection.execute(
+                "SELECT ocr_job_id FROM ocr_jobs WHERE ingestion_id = %s",
+                (ingestion_id,),
+            ).fetchone()
+            if existing:
+                return str(existing["ocr_job_id"])
             connection.execute(
                 """
                 INSERT INTO ocr_jobs (ocr_job_id, ingestion_id, status, queued_at_utc, attempt_count)
@@ -321,12 +579,31 @@ class PostgresRepository:
             self._audit(
                 connection, "system", "OCR_JOB", job_id, "OCR_QUEUED", None, "QUEUED", {"ingestion_id": ingestion_id}
             )
+            transitioned = connection.execute(
+                "UPDATE uploads SET state = 'OCR_QUEUED' WHERE ingestion_id = %s AND state = 'BRONZE_COMMITTED'",
+                (ingestion_id,),
+            )
+            if transitioned.rowcount != 1:
+                raise StateConflict("OCR queue transition was not atomic")
+            self._audit(
+                connection, "system", "UPLOAD", ingestion_id,
+                "UPLOAD_STATE_CHANGED", "BRONZE_COMMITTED", "OCR_QUEUED",
+                {"ocr_job_id": job_id},
+            )
         return job_id
 
     def get_upload(self, ingestion_id: str) -> dict[str, Any]:
         with self.connection() as connection:
             row = connection.execute(
-                "SELECT * FROM uploads WHERE ingestion_id = %s", (ingestion_id,)
+                """
+                SELECT upload_record.*, original.object_version_id AS original_object_version_id
+                FROM uploads upload_record
+                LEFT JOIN bronze_objects original
+                  ON original.ingestion_id = upload_record.ingestion_id
+                 AND original.object_kind = 'ORIGINAL'
+                WHERE upload_record.ingestion_id = %s
+                """,
+                (ingestion_id,),
             ).fetchone()
             if not row:
                 raise KeyError(ingestion_id)
@@ -849,9 +1126,15 @@ class PostgresRepository:
         with self.connection() as connection:
             row = connection.execute(
                 """
-                SELECT j.ocr_job_id, j.ingestion_id, u.stored_object_key, u.detected_mime_type,
-                    u.declared_file_type, u.document_category, u.source_sha256
-                FROM ocr_jobs j JOIN uploads u USING (ingestion_id)
+                SELECT j.ocr_job_id, j.ingestion_id, u.stored_object_key,
+                    original.object_version_id AS original_object_version_id,
+                    u.detected_mime_type, u.declared_file_type,
+                    u.document_category, u.source_sha256
+                FROM ocr_jobs j
+                JOIN uploads u USING (ingestion_id)
+                JOIN bronze_pairs pair_record USING (ingestion_id)
+                JOIN bronze_objects original
+                  ON original.bronze_object_id = pair_record.original_bronze_object_id
                 WHERE j.status = 'QUEUED' AND u.state = 'OCR_QUEUED'
                 ORDER BY j.queued_at_utc LIMIT 1
                 """

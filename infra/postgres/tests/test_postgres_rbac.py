@@ -175,6 +175,39 @@ class RuntimeRoleContractTests(unittest.TestCase):
             )
         )
 
+    def test_bronze_pair_tables_are_ingestion_write_backup_read_only(self) -> None:
+        self.assertEqual(
+            {
+                "bronze_pairs",
+                "bronze_protected_orphans",
+                "bronze_reconciliation_events",
+            },
+            set(rbac_contract.BRONZE_PAIR_TABLES),
+        )
+        pair_privileges = {
+            item
+            for item in rbac_contract.TABLE_PRIVILEGES
+            if item[1] in rbac_contract.BRONZE_PAIR_TABLES
+        }
+        self.assertEqual(
+            {
+                *(("smartcoat_ingestion", table, privilege)
+                  for table in rbac_contract.BRONZE_PAIR_TABLES
+                  for privilege in ("SELECT", "INSERT")),
+                *(("smartcoat_backup", table, "SELECT")
+                  for table in rbac_contract.BRONZE_PAIR_TABLES),
+            },
+            pair_privileges,
+        )
+        for role in ("smartcoat_ocr", "smartcoat_review", "smartcoat_app"):
+            self.assertFalse(any(item[0] == role for item in pair_privileges))
+        self.assertFalse(
+            any(
+                item[1] in rbac_contract.BRONZE_PAIR_TABLES
+                for item in rbac_contract.COLUMN_UPDATE_PRIVILEGES
+            )
+        )
+
 
 class CredentialProvisioningBoundaryTests(unittest.TestCase):
     def test_admin_url_is_explicit_and_database_url_is_not_a_fallback(self) -> None:

@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import hashlib
 from copy import deepcopy
+from datetime import UTC, datetime
 from threading import RLock
 from typing import Any
 
 from domain import StateConflict
 from identifiers import uuid7
+from retention_enforcement import RetentionEnforcementEvidence
 
 
 class MemoryStorage:
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], bytes] = {}
+        self.versions: dict[tuple[str, str], str] = {}
         self.puts: list[tuple[str, str, bool]] = []
 
     def put_once(
@@ -21,12 +24,24 @@ class MemoryStorage:
         identifier = (bucket, key)
         if identifier in self.objects:
             raise StateConflict("immutable key exists")
+        version_id = uuid7()
         self.objects[identifier] = bytes(data)
+        self.versions[identifier] = version_id
         self.puts.append((bucket, key, locked))
-        return {"version_id": uuid7()}
+        return {"version_id": version_id}
 
     def get(self, bucket: str, key: str) -> bytes:
         return self.objects[(bucket, key)]
+
+    def get_exact(self, bucket: str, key: str, version_id: str) -> bytes:
+        identifier = (bucket, key)
+        if self.versions[identifier] != version_id:
+            raise KeyError(version_id)
+        return self.objects[identifier]
+
+    def list_exact_versions(self, bucket: str, key: str) -> list[str]:
+        identifier = (bucket, key)
+        return [self.versions[identifier]] if identifier in self.versions else []
 
     def delete(self, bucket: str, key: str) -> None:
         del bucket, key
@@ -43,6 +58,10 @@ class MemoryRepository:
         self.reviews: list[dict[str, Any]] = []
         self.verified: list[dict[str, Any]] = []
         self.audit: list[dict[str, Any]] = []
+        self.pairs: dict[str, dict[str, Any]] = {}
+        self.orphans: list[dict[str, Any]] = []
+        self.reconciliations: list[dict[str, Any]] = []
+        self.bronze_fault_checkpoint: str | None = None
         self.review_fault_checkpoint: str | None = None
         self._review_lock = RLock()
 
@@ -85,9 +104,113 @@ class MemoryRepository:
         self.uploads[upload["ingestion_id"]] = deepcopy(upload)
         self._audit(upload["ingestion_id"], "UPLOAD_RECEIVED", None, "RECEIVED", upload["uploader_user_id"])
 
-    def commit_bronze(self, upload: dict[str, Any], objects: list[dict[str, Any]]) -> None:
-        self.objects.extend({**deepcopy(item), "ingestion_id": upload["ingestion_id"]} for item in objects)
-        self._audit(upload["ingestion_id"], "BRONZE_OBJECTS_VERIFIED", "RECEIVED", "RECEIVED", "system")
+    def _bronze_checkpoint(self, checkpoint: str) -> None:
+        if self.bronze_fault_checkpoint == checkpoint:
+            raise RuntimeError(f"synthetic Bronze fault at {checkpoint}")
+
+    def commit_bronze_pair(
+        self,
+        upload: dict[str, Any],
+        members: list[dict[str, Any]],
+        pair: dict[str, Any],
+    ) -> None:
+        ingestion_id = upload["ingestion_id"]
+        existing = self.pairs.get(ingestion_id)
+        if existing:
+            if existing["pair_identity_sha256"] != pair["pair_identity_sha256"]:
+                raise StateConflict("Conflicting successful Bronze pair")
+            return
+        snapshot = deepcopy((self.objects, self.pairs, self.uploads, self.audit))
+        try:
+            if {member["kind"] for member in members} != {"ORIGINAL", "MANIFEST"}:
+                raise StateConflict("Successful Bronze commit requires an original and manifest")
+            self.objects.extend(
+                {**deepcopy(item), "ingestion_id": ingestion_id} for item in members
+            )
+            self._bronze_checkpoint("after_objects")
+            self._bronze_checkpoint("after_retention_evidence")
+            self.pairs[ingestion_id] = {**deepcopy(pair), "ingestion_id": ingestion_id}
+            self._bronze_checkpoint("after_pair")
+            self._bronze_checkpoint("before_state_transition")
+            if self.uploads[ingestion_id]["state"] != "RECEIVED":
+                raise StateConflict("Bronze pair cannot commit from current state")
+            self.uploads[ingestion_id]["state"] = "BRONZE_COMMITTED"
+            self._audit(
+                ingestion_id, "BRONZE_PAIR_COMMITTED", "RECEIVED",
+                "BRONZE_COMMITTED", "system",
+                {"pair_identity_sha256": pair["pair_identity_sha256"]},
+            )
+            self._bronze_checkpoint("before_commit")
+        except Exception:
+            self.objects, self.pairs, self.uploads, self.audit = snapshot
+            raise
+
+    def record_protected_orphans(
+        self,
+        upload: dict[str, Any],
+        members: list[dict[str, Any]],
+        failure_stage: str,
+        failure_code: str,
+    ) -> None:
+        for item in members:
+            identity = (
+                upload["ingestion_id"], item["bucket"], item["key"],
+                item["version_id"], item["retention"]["retention_policy_version"],
+            )
+            if any(row["identity"] == identity for row in self.orphans):
+                continue
+            self.orphans.append(
+                {
+                    **deepcopy(item), "identity": identity,
+                    "ingestion_id": upload["ingestion_id"],
+                    "failure_stage": failure_stage, "failure_code": failure_code,
+                }
+            )
+        self._audit(
+            upload["ingestion_id"], "PROTECTED_ORPHAN_RECORDED",
+            "RECEIVED", "RECEIVED", "system",
+            {"member_count": len(members), "failure_stage": failure_stage},
+        )
+
+    def bronze_reconciliation_context(self, ingestion_id: str) -> dict[str, Any]:
+        members = [
+            {key: deepcopy(row[key]) for key in (
+                "bucket", "key", "kind", "version_id", "sha256"
+            )} | {
+                "retention_policy_version": row["retention"]["retention_policy_version"]
+            }
+            for row in self.orphans if row["ingestion_id"] == ingestion_id
+        ]
+        canonical = [
+            {key: row[key] for key in (
+                "bucket", "key", "version_id", "retention_policy_version"
+            )}
+            for row in sorted(members, key=lambda value: value["kind"])
+        ]
+        retry = hashlib.sha256(
+            __import__("json").dumps(
+                canonical, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest() if canonical else None
+        return {
+            "upload": deepcopy(self.uploads[ingestion_id]),
+            "pair": deepcopy(self.pairs.get(ingestion_id)),
+            "orphans": members,
+            "retry_identity_sha256": retry,
+        }
+
+    def record_reconciliation(
+        self,
+        ingestion_id: str,
+        retry_identity_sha256: str,
+        outcome: str,
+        details: dict[str, Any],
+    ) -> None:
+        identity = (ingestion_id, retry_identity_sha256, outcome)
+        if not any(row["identity"] == identity for row in self.reconciliations):
+            self.reconciliations.append(
+                {"identity": identity, "details": deepcopy(details)}
+            )
 
     def transition(
         self,
@@ -103,9 +226,22 @@ class MemoryRepository:
         upload["state"] = new_state
         self._audit(ingestion_id, "UPLOAD_STATE_CHANGED", previous_state, new_state, actor, details)
 
-    def queue_ocr(self, ingestion_id: str) -> str:
+    def ensure_ocr_queued(self, ingestion_id: str) -> str:
+        existing = next(
+            (job for job in self.jobs.values() if job["ingestion_id"] == ingestion_id),
+            None,
+        )
+        if existing:
+            return existing["ocr_job_id"]
+        if ingestion_id not in self.pairs or self.uploads[ingestion_id]["state"] != "BRONZE_COMMITTED":
+            raise StateConflict("OCR cannot be queued before a successful Bronze pair commit")
         job_id = uuid7()
         self.jobs[job_id] = {"ocr_job_id": job_id, "ingestion_id": ingestion_id, "status": "QUEUED"}
+        self.uploads[ingestion_id]["state"] = "OCR_QUEUED"
+        self._audit(
+            ingestion_id, "UPLOAD_STATE_CHANGED", "BRONZE_COMMITTED",
+            "OCR_QUEUED", "system", {"ocr_job_id": job_id},
+        )
         return job_id
 
     def get_upload(self, ingestion_id: str) -> dict[str, Any]:
@@ -308,3 +444,39 @@ class MemoryRepository:
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+class MemoryRetentionEnforcer:
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+        self.fail_kind: str | None = None
+
+    def enforce(self, **values: Any) -> RetentionEnforcementEvidence:
+        target = values["target"]
+        self.calls.append(target)
+        if self.fail_kind == target.object_kind:
+            raise RuntimeError(f"synthetic {target.object_kind} protection failure")
+        accepted = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+        return RetentionEnforcementEvidence(
+            retention_assignment_id=values["retention_assignment_id"],
+            bucket_name=target.bucket_name,
+            object_key=target.object_key,
+            object_kind=target.object_kind,
+            object_version_id=target.object_version_id,
+            data_category=values["data_category"],
+            retention_class=values["retention_class"],
+            retention_policy_version=values["retention_policy_version"],
+            accepted_storage_at_utc=accepted,
+            requested_retention_mode="COMPLIANCE",
+            requested_retain_until_utc=datetime(2036, 8, 29, 12, 0, tzinfo=UTC),
+            requested_legal_hold_status="ON",
+            observed_object_version_id=target.object_version_id,
+            observed_retention_mode="COMPLIANCE",
+            observed_retain_until_utc=datetime(2036, 8, 29, 12, 0, tzinfo=UTC),
+            observed_legal_hold_status="ON",
+            enforcement_verified_at_utc=accepted,
+            enforcement_verification_result="SUCCESS",
+            failure_code=None,
+            enforced_by=values["enforced_by"],
+            details_json={"exact_version_readback": True},
+        )
