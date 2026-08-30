@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from identifiers import uuid7
+from operational_logging import current_correlation_id, log_event
 from retention_enforcement import ExactVersionTarget, RetentionEnforcementEvidence
 from retention_policy import (
     RETENTION_POLICY_VERSION,
@@ -77,7 +78,9 @@ class Repository(Protocol):
         details: dict[str, Any] | None = None,
     ) -> None: ...
 
-    def ensure_ocr_queued(self, ingestion_id: str) -> str: ...
+    def ensure_ocr_queued(
+        self, ingestion_id: str, correlation_id: str | None = None
+    ) -> str: ...
 
     def get_upload(self, ingestion_id: str) -> dict[str, Any]: ...
 
@@ -180,13 +183,33 @@ class IngestionService:
             raise StateConflict(f"{kind} upload did not return an exact version ID")
         rule = resolve_category_rule(document_category)
         assignment_id = uuid7()
-        evidence = self.retention_enforcer.enforce(
-            target=ExactVersionTarget(bucket, key, version_id, kind),
-            retention_assignment_id=assignment_id,
-            data_category=rule.data_category,
-            retention_class=rule.retention_class,
-            retention_policy_version=RETENTION_POLICY_VERSION,
-            enforced_by="ingestion-service",
+        try:
+            evidence = self.retention_enforcer.enforce(
+                target=ExactVersionTarget(bucket, key, version_id, kind),
+                retention_assignment_id=assignment_id,
+                data_category=rule.data_category,
+                retention_class=rule.retention_class,
+                retention_policy_version=RETENTION_POLICY_VERSION,
+                enforced_by="ingestion-service",
+            )
+        except Exception as exc:
+            log_event(
+                "ERROR",
+                "retention.enforcement.failed",
+                bucket=bucket,
+                object_key=key,
+                object_version_id=version_id,
+                retention_class=rule.retention_class,
+                error_type=type(exc).__name__,
+            )
+            raise
+        log_event(
+            "INFO",
+            "retention.enforcement.completed",
+            bucket=bucket,
+            object_key=key,
+            object_version_id=version_id,
+            retention_class=evidence.retention_class,
         )
         stored = self.storage.get_exact(bucket, key, version_id)
         if hashlib.sha256(stored).hexdigest() != digest:
@@ -261,6 +284,16 @@ class IngestionService:
                 try:
                     manifest = json.loads(content)
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    log_event(
+                        "WARNING",
+                        "bronze.manifest.discovery_rejected",
+                        ingestion_id=str(upload["ingestion_id"]),
+                        bucket=bucket,
+                        object_key=key,
+                        object_version_id=version_id,
+                        reason="NON_CANONICAL_JSON",
+                        error_type=type(exc).__name__,
+                    )
                     raise StateConflict("Discovered manifest is not canonical JSON") from exc
                 original_version_id = next(
                     (
@@ -309,18 +342,52 @@ class IngestionService:
                 self.max_upload_bytes,
             )
         except UploadValidationError as exc:
+            log_event(
+                "WARNING",
+                "ingestion.validation.rejected",
+                ingestion_id=ingestion_id,
+                actor_id=actor.user_id,
+                reason=exc.reason,
+                validation_code=exc.code,
+                error_type=type(exc).__name__,
+            )
             self.repository.record_rejection(ingestion_id, actor.user_id, exc.reason, exc.code)
+            log_event(
+                "INFO",
+                "state.transition",
+                ingestion_id=ingestion_id,
+                actor_id=actor.user_id,
+                state_from="RECEIVED",
+                state_to="REJECTED",
+            )
             raise
 
         try:
             resolve_category_rule(document_category)
         except RetentionPolicyError as exc:
             reason = "Document category has no approved retention assignment"
+            log_event(
+                "WARNING",
+                "ingestion.retention.rejected",
+                ingestion_id=ingestion_id,
+                actor_id=actor.user_id,
+                document_category=document_category,
+                reason="RETENTION_CLASSIFICATION_PENDING",
+                error_type=type(exc).__name__,
+            )
             self.repository.record_rejection(
                 ingestion_id,
                 actor.user_id,
                 reason,
                 "RETENTION_CLASSIFICATION_PENDING",
+            )
+            log_event(
+                "INFO",
+                "state.transition",
+                ingestion_id=ingestion_id,
+                actor_id=actor.user_id,
+                state_from="RECEIVED",
+                state_to="REJECTED",
             )
             raise UploadValidationError(
                 reason,
@@ -354,12 +421,30 @@ class IngestionService:
             "state": "RECEIVED",
         }
         self.repository.create_received(upload)
+        log_event(
+            "INFO",
+            "state.transition",
+            ingestion_id=ingestion_id,
+            actor_id=actor.user_id,
+            state_from=None,
+            state_to="RECEIVED",
+        )
 
         protected: list[dict[str, Any]] = []
         stage = "original_upload"
         try:
             original_result = self.storage.put_once(
                 ORIGINALS_BUCKET, original_key, data, validated.mime_type, locked=False
+            )
+            log_event(
+                "INFO",
+                "bronze.original.committed",
+                ingestion_id=ingestion_id,
+                bucket=ORIGINALS_BUCKET,
+                object_key=original_key,
+                object_version_id=original_result.get("version_id"),
+                byte_count=len(data),
+                sha256=digest,
             )
             stage = "original_protection"
             original_member = self._protect_member(
@@ -399,6 +484,16 @@ class IngestionService:
             manifest_result = self.storage.put_once(
                 MANIFESTS_BUCKET, manifest_key, manifest_bytes, "application/json", locked=False
             )
+            log_event(
+                "INFO",
+                "bronze.manifest.committed",
+                ingestion_id=ingestion_id,
+                bucket=MANIFESTS_BUCKET,
+                object_key=manifest_key,
+                object_version_id=manifest_result.get("version_id"),
+                byte_count=len(manifest_bytes),
+                sha256=manifest_digest,
+            )
             stage = "manifest_protection"
             manifest_member = self._protect_member(
                 bucket=MANIFESTS_BUCKET,
@@ -428,17 +523,66 @@ class IngestionService:
                     "retention_policy_version": original_member["retention"]["retention_policy_version"],
                 },
             )
+            log_event(
+                "INFO",
+                "bronze.pair.committed",
+                ingestion_id=ingestion_id,
+                pair_identity_sha256=pair_identity,
+                original_object_version_id=original_member["version_id"],
+                manifest_object_version_id=manifest_member["version_id"],
+                retention_class=original_member["retention"]["retention_class"],
+            )
+            log_event(
+                "INFO",
+                "state.transition",
+                ingestion_id=ingestion_id,
+                actor_id="system",
+                state_from="RECEIVED",
+                state_to="BRONZE_COMMITTED",
+            )
         except Exception as exc:
+            log_event(
+                "ERROR",
+                "bronze.pair.failed",
+                ingestion_id=ingestion_id,
+                failure_stage=stage,
+                protected_member_count=len(protected),
+                error_type=type(exc).__name__,
+            )
             self._record_orphans(upload, protected, stage, exc)
             raise
-        job_id = self.repository.ensure_ocr_queued(ingestion_id)
+        job_id = self.repository.ensure_ocr_queued(
+            ingestion_id, current_correlation_id()
+        )
+        log_event(
+            "INFO",
+            "ocr.job.queued",
+            ingestion_id=ingestion_id,
+            ocr_job_id=job_id,
+        )
+        log_event(
+            "INFO",
+            "state.transition",
+            ingestion_id=ingestion_id,
+            actor_id="system",
+            state_from="BRONZE_COMMITTED",
+            state_to="OCR_QUEUED",
+        )
         return {"ingestion_id": ingestion_id, "ocr_job_id": job_id, "manifest": manifest}
 
     def reconcile(self, ingestion_id: str) -> dict[str, Any]:
         context = self.repository.bronze_reconciliation_context(ingestion_id)
         upload = context["upload"]
         if context.get("pair"):
-            job_id = self.repository.ensure_ocr_queued(ingestion_id)
+            job_id = self.repository.ensure_ocr_queued(
+                ingestion_id, current_correlation_id()
+            )
+            log_event(
+                "INFO",
+                "ocr.job.reused",
+                ingestion_id=ingestion_id,
+                ocr_job_id=job_id,
+            )
             return {"ingestion_id": ingestion_id, "ocr_job_id": job_id, "status": "ALREADY_COMMITTED"}
         members = list(context.get("orphans", []))
         if len(members) != 2:
@@ -486,7 +630,21 @@ class IngestionService:
         self.repository.record_reconciliation(
             ingestion_id, identity, "COMPLETED_PAIR", {"exact_version_readback": True}
         )
-        job_id = self.repository.ensure_ocr_queued(ingestion_id)
+        log_event(
+            "INFO",
+            "bronze.reconciliation.completed",
+            ingestion_id=ingestion_id,
+            pair_identity_sha256=identity,
+        )
+        job_id = self.repository.ensure_ocr_queued(
+            ingestion_id, current_correlation_id()
+        )
+        log_event(
+            "INFO",
+            "ocr.job.queued",
+            ingestion_id=ingestion_id,
+            ocr_job_id=job_id,
+        )
         return {"ingestion_id": ingestion_id, "ocr_job_id": job_id, "status": "RECONCILED"}
 
 
@@ -509,6 +667,14 @@ class OCRDomainService:
                 "source_sha256": upload["sha256"],
                 "started_at_utc": utc_now(),
             },
+        )
+        log_event(
+            "INFO",
+            "ocr.run.started",
+            ingestion_id=ingestion_id,
+            ocr_run_id=run_id,
+            engine=engine,
+            engine_version=engine_version,
         )
         return run_id
 
@@ -543,6 +709,14 @@ class OCRDomainService:
         self.repository.complete_ocr_run(ingestion_id, run, draft)
         self.repository.transition(ingestion_id, "OCR_QUEUED", "OCR_COMPLETED", "ocr-worker")
         self.repository.transition(ingestion_id, "OCR_COMPLETED", "SILVER_DRAFT_READY", "ocr-worker")
+        log_event(
+            "INFO",
+            "ocr.run.completed",
+            ingestion_id=ingestion_id,
+            ocr_run_id=run_id,
+            raw_output_sha256=run["raw_output_sha256"],
+            object_key=artifact_key,
+        )
         return draft
 
 
@@ -564,13 +738,42 @@ class ReviewService:
         draft = self.repository.get_draft(draft_id)
         upload = self.repository.get_upload(draft["ingestion_id"])
         ingestion_id = str(upload["ingestion_id"])
+        was_replay = draft["status"] == "REVIEWED"
         if draft["status"] not in {"DRAFT_UNVERIFIED", "REVIEWED"}:
+            log_event(
+                "WARNING",
+                "review.validation.rejected",
+                ingestion_id=ingestion_id,
+                actor_id=reviewer.user_id,
+                reason="DRAFT_NOT_REVIEWABLE",
+            )
             raise StateConflict("Only an unverified draft can be reviewed")
         if decision not in APPROVAL_DECISIONS | REJECTION_DECISIONS:
+            log_event(
+                "WARNING",
+                "review.validation.rejected",
+                ingestion_id=ingestion_id,
+                actor_id=reviewer.user_id,
+                reason="UNSUPPORTED_DECISION",
+            )
             raise ReviewValidationError("Unsupported review decision")
         if not explicit_confirmation:
+            log_event(
+                "WARNING",
+                "review.validation.rejected",
+                ingestion_id=ingestion_id,
+                actor_id=reviewer.user_id,
+                reason="SOURCE_CONFIRMATION_REQUIRED",
+            )
             raise ReviewValidationError("Explicit source-comparison confirmation is required")
         if decision in APPROVAL_DECISIONS and not verified_text.strip():
+            log_event(
+                "WARNING",
+                "review.validation.rejected",
+                ingestion_id=ingestion_id,
+                actor_id=reviewer.user_id,
+                reason="VERIFIED_TEXT_REQUIRED",
+            )
             raise ReviewValidationError("Verified text is required for approval")
 
         self_review_detected = reviewer.user_id == upload["uploader_user_id"]
@@ -581,6 +784,13 @@ class ReviewService:
                 solo_exception_applied = True
                 exception_reason = SOLO_EXCEPTION_REASON
             elif not administrator_exception_reason:
+                log_event(
+                    "WARNING",
+                    "review.validation.rejected",
+                    ingestion_id=ingestion_id,
+                    actor_id=reviewer.user_id,
+                    reason="SELF_REVIEW_EXCEPTION_REQUIRED",
+                )
                 raise ReviewValidationError("Self-review requires an administrator exception reason")
 
         review_id = uuid7()
@@ -635,7 +845,62 @@ class ReviewService:
                 "source_object_key": upload["stored_object_key"],
                 "ocr_artifact_key": draft["raw_artifact_key"],
             }
-        return self.repository.complete_review(review, verified)
+        result = self.repository.complete_review(review, verified)
+        final_state = "VERIFIED" if verified else "REVIEW_REJECTED"
+        if was_replay:
+            log_event(
+                "INFO",
+                "review.decision.replayed",
+                ingestion_id=ingestion_id,
+                draft_id=draft_id,
+                actor_id=reviewer.user_id,
+                decision=decision,
+                outcome=final_state,
+            )
+            return result
+        log_event(
+            "INFO",
+            "review.decision.recorded",
+            ingestion_id=ingestion_id,
+            draft_id=draft_id,
+            actor_id=reviewer.user_id,
+            decision=decision,
+            outcome=final_state,
+        )
+        if upload["state"] == "SILVER_DRAFT_READY":
+            log_event(
+                "INFO",
+                "state.transition",
+                ingestion_id=ingestion_id,
+                actor_id=reviewer.user_id,
+                state_from="SILVER_DRAFT_READY",
+                state_to="UNDER_HUMAN_REVIEW",
+            )
+        log_event(
+            "INFO",
+            "state.transition",
+            ingestion_id=ingestion_id,
+            actor_id=reviewer.user_id,
+            state_from=(
+                "UNDER_HUMAN_REVIEW"
+                if upload["state"] == "SILVER_DRAFT_READY"
+                else upload["state"]
+            ),
+            state_to=final_state,
+        )
+        log_event(
+            "INFO",
+            (
+                "review.verification.completed"
+                if verified
+                else "review.rejection.completed"
+            ),
+            ingestion_id=ingestion_id,
+            draft_id=draft_id,
+            actor_id=reviewer.user_id,
+            decision=decision,
+        )
+        return result
 
     def edit_verified(self, ingestion_id: str, actor: Actor, text: str) -> dict[str, Any]:
         upload = self.repository.get_upload(ingestion_id)
@@ -648,5 +913,12 @@ class ReviewService:
             "UNDER_HUMAN_REVIEW",
             actor.user_id,
             {"pending_silver_revision": self.repository.max_silver_revision(ingestion_id) + 1},
+        )
+        log_event(
+            "INFO",
+            "review.revision.created",
+            ingestion_id=ingestion_id,
+            draft_id=draft["silver_draft_id"],
+            actor_id=actor.user_id,
         )
         return draft

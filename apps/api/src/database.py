@@ -9,6 +9,7 @@ from psycopg.rows import dict_row
 
 from domain import StateConflict
 from identifiers import uuid7
+from operational_logging import log_event
 
 
 class PostgresRepository:
@@ -553,9 +554,19 @@ class PostgresRepository:
                 new_state,
                 details,
             )
+        log_event(
+            "INFO",
+            "state.transition",
+            ingestion_id=ingestion_id,
+            actor_id=actor,
+            state_from=previous_state,
+            state_to=new_state,
+        )
 
-    def ensure_ocr_queued(self, ingestion_id: str) -> str:
-        job_id = uuid7()
+    def ensure_ocr_queued(
+        self, ingestion_id: str, correlation_id: str | None = None
+    ) -> str:
+        job_id = correlation_id or uuid7()
         with self.connection() as connection:
             upload = connection.execute(
                 "SELECT state FROM uploads WHERE ingestion_id = %s FOR UPDATE",
@@ -1012,9 +1023,23 @@ class PostgresRepository:
                 )
                 return verified_result
         except psycopg.errors.UniqueViolation as exc:
+            log_event(
+                "WARNING",
+                "review.unique_conflict.replay",
+                ingestion_id=decision["ingestion_id"],
+                draft_id=decision["silver_draft_id"],
+                error_type=type(exc).__name__,
+            )
             try:
                 return self._replay_review_after_unique_conflict(decision)
-            except StateConflict:
+            except StateConflict as conflict:
+                log_event(
+                    "WARNING",
+                    "review.unique_conflict.rejected",
+                    ingestion_id=decision["ingestion_id"],
+                    draft_id=decision["silver_draft_id"],
+                    error_type=type(conflict).__name__,
+                )
                 raise StateConflict(
                     "The Silver draft already has a different effective review outcome"
                 ) from exc

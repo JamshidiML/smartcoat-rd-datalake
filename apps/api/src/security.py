@@ -6,6 +6,8 @@ import hmac
 import json
 import time
 
+from operational_logging import log_event
+
 
 class InvalidSession(ValueError):
     pass
@@ -41,6 +43,12 @@ def verify_session(token: str, secret: str) -> str:
             raise InvalidSession("Session expired")
         return str(payload["sub"])
     except (ValueError, KeyError, json.JSONDecodeError) as exc:
+        log_event(
+            "WARNING",
+            "auth.session.parse_failed",
+            reason=str(exc),
+            error_type=type(exc).__name__,
+        )
         if isinstance(exc, InvalidSession):
             raise
         raise InvalidSession("Malformed session") from exc

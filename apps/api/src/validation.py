@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+from operational_logging import log_event
+
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 ALLOWED_CATEGORIES = {
@@ -82,6 +84,13 @@ def _validate_xlsx(data: bytes) -> None:
             if workbook.testzip() is not None:
                 raise UploadValidationError("Excel workbook is corrupt", "CORRUPT_FILE")
     except zipfile.BadZipFile as exc:
+        log_event(
+            "WARNING",
+            "validation.exception.caught",
+            reason="CORRUPT_EXCEL_ARCHIVE",
+            validation_code="CORRUPT_FILE",
+            error_type=type(exc).__name__,
+        )
         raise UploadValidationError("Excel workbook is corrupt", "CORRUPT_FILE") from exc
 
 
@@ -108,6 +117,13 @@ def validate_upload(
         try:
             date.fromisoformat(capture_date)
         except ValueError as exc:
+            log_event(
+                "WARNING",
+                "validation.exception.caught",
+                reason="INVALID_CAPTURE_DATE",
+                validation_code="INVALID_METADATA",
+                error_type=type(exc).__name__,
+            )
             raise UploadValidationError("Capture date must be an ISO-8601 date", "INVALID_METADATA") from exc
 
     mime_type, file_type = _detect_mime(data)

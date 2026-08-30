@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable, Protocol
 
+from operational_logging import log_event
 from retention_policy import (
     CANONICAL_RETENTION_CLASSES,
     RETENTION_POLICY_VERSION,
@@ -158,7 +159,23 @@ class MinioExactVersionRetentionStorage:
             )
         except self.s3_error_type as exc:
             if exc.code in {"NoSuchObjectLockConfiguration", "NoSuchRetention"}:
+                log_event(
+                    "INFO",
+                    "retention.readback.absent",
+                    bucket=target.bucket_name,
+                    object_key=target.object_key,
+                    object_version_id=target.object_version_id,
+                    error_type=type(exc).__name__,
+                )
                 return None
+            log_event(
+                "ERROR",
+                "retention.readback.failed",
+                bucket=target.bucket_name,
+                object_key=target.object_key,
+                object_version_id=target.object_version_id,
+                error_type=type(exc).__name__,
+            )
             raise
         if value is None or value.mode is None or value.retain_until_date is None:
             return None
@@ -214,14 +231,40 @@ class HttpLegalHoldMediator:
             },
             method="POST",
         )
+        log_event(
+            "INFO",
+            "legal_hold.call.started",
+            operation=operation,
+            bucket=target.bucket_name,
+            object_key=target.object_key,
+            object_version_id=target.object_version_id,
+        )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 value = json.loads(response.read())
         except (OSError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
+            log_event(
+                "ERROR",
+                "legal_hold.call.failed",
+                operation=operation,
+                bucket=target.bucket_name,
+                object_key=target.object_key,
+                object_version_id=target.object_version_id,
+                error_type=type(exc).__name__,
+            )
             raise RetentionEnforcementError("LEGAL_HOLD_MEDIATOR_UNAVAILABLE") from exc
         status = value.get("legal_hold")
         if status not in {"ON", "OFF"}:
             raise RetentionEnforcementError("LEGAL_HOLD_READBACK_UNAVAILABLE")
+        log_event(
+            "INFO",
+            "legal_hold.call.completed",
+            operation=operation,
+            bucket=target.bucket_name,
+            object_key=target.object_key,
+            object_version_id=target.object_version_id,
+            legal_hold_status=status,
+        )
         return status
 
     def apply_on(self, target: ExactVersionTarget) -> str:

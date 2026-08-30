@@ -72,11 +72,13 @@ class QueueCrashRepository(MemoryRepository):
         super().__init__()
         self.queue_crashes = 1
 
-    def ensure_ocr_queued(self, ingestion_id: str) -> str:
+    def ensure_ocr_queued(
+        self, ingestion_id: str, correlation_id: str | None = None
+    ) -> str:
         if self.queue_crashes:
             self.queue_crashes -= 1
             raise RuntimeError("synthetic crash before OCR queue")
-        return super().ensure_ocr_queued(ingestion_id)
+        return super().ensure_ocr_queued(ingestion_id, correlation_id)
 
 
 class ConflictingContextRepository(MemoryRepository):

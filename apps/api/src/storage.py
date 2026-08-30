@@ -7,6 +7,7 @@ from minio import Minio
 from minio.error import S3Error
 
 from domain import StateConflict
+from operational_logging import log_event
 
 
 class MinioObjectStorage:
@@ -26,7 +27,23 @@ class MinioObjectStorage:
             self.client.stat_object(bucket, key)
         except S3Error as exc:
             if exc.code not in {"NoSuchKey", "NoSuchObject"}:
+                log_event(
+                    "ERROR",
+                    "storage.object.stat_failed",
+                    bucket=bucket,
+                    object_key=key,
+                    error_type=type(exc).__name__,
+                    storage_error_code=exc.code,
+                )
                 raise
+            log_event(
+                "DEBUG",
+                "storage.object.not_found",
+                bucket=bucket,
+                object_key=key,
+                error_type=type(exc).__name__,
+                storage_error_code=exc.code,
+            )
         else:
             raise StateConflict(f"Immutable object already exists: {bucket}/{key}")
 
