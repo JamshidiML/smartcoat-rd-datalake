@@ -3,7 +3,10 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "integration/**"
+      - "agent/**"
 
 permissions:
   contents: read
@@ -19,11 +22,23 @@ jobs:
       - name: Install validation tools
         run: python -m pip install --disable-pip-version-check ruff==0.12.11 jsonschema==4.25.1 pyyaml==6.0.2
       - name: Lint Python
-        run: ruff check apps scripts
+        run: ruff check apps scripts infra
       - name: Validate contracts and Compose syntax
         run: python apps/api/tests/validate_repository.py
-      - name: Build native application images
-        run: docker compose --env-file .env.example build api web
+      - name: Run offline infrastructure tests
+        run: |
+          python -m unittest discover -s infra/minio/tests -p 'test_*.py' -v
+          python -m unittest discover -s infra/network/tests -p 'test_*.py' -v
+          python -m unittest discover -s infra/postgres/tests -p 'test_*.py' -v
+      - name: Run infrastructure focused regression checks
+        run: |
+          python infra/postgres/tests/live_migration_lifecycle_acceptance.py --run-focused-regression-checks
+          python infra/postgres/tests/live_migration_rollback_acceptance.py --run-focused-regression-checks
+          python infra/postgres/tests/live_migration_lock_acceptance.py --run-focused-regression-checks
+          python infra/postgres/tests/live_migration_drift_acceptance.py --run-focused-regression-checks
+          python infra/postgres/tests/live_migration_history_drift_acceptance.py --run-focused-regression-checks
+          python infra/postgres/tests/live_review_atomicity_acceptance.py --run-focused-regression-checks
+          python infra/postgres/tests/live_state_transition_acceptance.py --run-focused-regression-checks
       - name: Run API acceptance tests (AT-01 through AT-14)
         run: python -m unittest discover -s apps/api/tests -p 'test_*.py' -v
       - name: Run OCR tests

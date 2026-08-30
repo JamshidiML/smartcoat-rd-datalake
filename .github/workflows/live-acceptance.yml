@@ -1,0 +1,89 @@
+name: Manual live acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_disposable_run:
+        description: Type CONFIRM_DISPOSABLE_SYNTHETIC_LIVE_ACCEPTANCE
+        required: true
+        type: string
+      api_image_id:
+        description: Immutable API image ID (sha256:...)
+        required: true
+        type: string
+      ocr_image_id:
+        description: Immutable OCR-worker image ID (sha256:...)
+        required: true
+        type: string
+      legal_hold_image_id:
+        description: Immutable legal-hold-applier image ID (sha256:...)
+        required: true
+        type: string
+      retention_image_id:
+        description: Immutable retention-enforcement image ID (sha256:...)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smartcoat-live-acceptance
+  cancel-in-progress: false
+
+jobs:
+  live-acceptance:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require explicit disposable-run confirmation
+        env:
+          CONFIRM_DISPOSABLE_RUN: ${{ inputs.confirm_disposable_run }}
+        run: test "$CONFIRM_DISPOSABLE_RUN" = "CONFIRM_DISPOSABLE_SYNTHETIC_LIVE_ACCEPTANCE"
+      - name: Build native application images manually
+        run: docker compose --env-file .env.example build api web
+      - name: Run integrated migration lifecycle acceptance
+        run: python3 infra/postgres/tests/live_integrated_wave1_migration_acceptance.py lifecycle --confirm-disposable-synthetic-run
+      - name: Run integrated migration lock acceptance
+        run: python3 infra/postgres/tests/live_integrated_wave1_migration_acceptance.py lock --confirm-disposable-synthetic-lock-run
+      - name: Run integrated migration rollback acceptance
+        run: python3 infra/postgres/tests/live_integrated_wave1_migration_acceptance.py rollback --confirm-disposable-synthetic-rollback-run
+      - name: Run integrated migration drift acceptance
+        run: python3 infra/postgres/tests/live_integrated_wave1_migration_acceptance.py drift --confirm-disposable-synthetic-drift-run
+      - name: Run integrated migration history-drift acceptance
+        run: python3 infra/postgres/tests/live_integrated_wave1_migration_acceptance.py history --confirm-disposable-synthetic-four-scenario-drift-run
+      - name: Run PostgreSQL RBAC acceptance
+        run: python3 infra/postgres/tests/live_postgres_rbac_acceptance.py --confirm-disposable-synthetic-rbac-run
+      - name: Run state-transition acceptance
+        run: python3 infra/postgres/tests/live_state_transition_acceptance.py --confirm-disposable-synthetic-transition-run
+      - name: Run review-atomicity acceptance
+        run: python3 infra/postgres/tests/live_review_atomicity_acceptance.py --confirm-disposable-synthetic-review-run
+      - name: Run retention-metadata acceptance
+        run: python3 infra/postgres/tests/live_retention_metadata_acceptance.py --confirm-disposable-synthetic-retention-metadata-run
+      - name: Run network-segmentation acceptance
+        run: python3 infra/network/tests/live_network_segmentation_acceptance.py --confirm-disposable-synthetic-network-run
+      - name: Run Legal Hold mediation acceptance
+        env:
+          LEGAL_HOLD_IMAGE_ID: ${{ inputs.legal_hold_image_id }}
+        run: >-
+          python3 infra/minio/tests/live_legal_hold_mediation_acceptance.py
+          --confirm-disposable-synthetic-legal-hold-mediation-run
+          --legal-hold-applier-image "$LEGAL_HOLD_IMAGE_ID"
+      - name: Run retention-enforcement acceptance
+        env:
+          LEGAL_HOLD_IMAGE_ID: ${{ inputs.legal_hold_image_id }}
+          RETENTION_IMAGE_ID: ${{ inputs.retention_image_id }}
+        run: >-
+          python3 infra/minio/tests/live_retention_enforcement_acceptance.py
+          --confirm-disposable-synthetic-retention-enforcement-run
+          --retention-image "$RETENTION_IMAGE_ID"
+          --legal-hold-image "$LEGAL_HOLD_IMAGE_ID"
+      - name: Run Bronze Pair acceptance
+        env:
+          API_IMAGE_ID: ${{ inputs.api_image_id }}
+          OCR_IMAGE_ID: ${{ inputs.ocr_image_id }}
+        run: >-
+          python3 infra/postgres/tests/live_bronze_pair_acceptance.py
+          --confirm-disposable-synthetic-bronze-pair-run
+          --api-image-id "$API_IMAGE_ID"
+          --ocr-image-id "$OCR_IMAGE_ID"
