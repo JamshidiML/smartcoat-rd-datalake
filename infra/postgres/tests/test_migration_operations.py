@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 COMPOSE_FILE = ROOT / "compose.yaml"
 EXAMPLE_ENV = ROOT / ".env.example"
 MIGRATION_SERVICE = "postgres-migrate"
+RUN_EXTERNAL_TESTS = os.environ.get("SMARTCOAT_EXTERNAL_TESTS") == "1"
 
 EXPECTED_EXISTING_NETWORKS = {
     "postgres": {"backend"},
@@ -70,6 +71,10 @@ def environment_without_migration_url(replacement: str | None) -> str:
     return "".join(result)
 
 
+@unittest.skipUnless(
+    RUN_EXTERNAL_TESTS,
+    "requires Docker Compose; enabled by manual live acceptance",
+)
 class MigrationOperationsTests(unittest.TestCase):
     compose: dict[str, Any]
     services: dict[str, Any]

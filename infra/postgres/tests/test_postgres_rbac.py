@@ -18,6 +18,7 @@ COMPATIBILITY_MIGRATION = (
 )
 PROVISIONER = POSTGRES_ROOT / "provision_runtime_roles.py"
 LIVE_ACCEPTANCE = POSTGRES_ROOT / "tests/live_postgres_rbac_acceptance.py"
+RUN_EXTERNAL_TESTS = os.environ.get("SMARTCOAT_EXTERNAL_TESTS") == "1"
 
 sys.path.insert(0, str(POSTGRES_ROOT))
 import rbac_contract  # noqa: E402
@@ -260,6 +261,10 @@ class CredentialProvisioningBoundaryTests(unittest.TestCase):
                 reused,
             )
 
+    @unittest.skipUnless(
+        RUN_EXTERNAL_TESTS,
+        "requires an external Python process; enabled by manual live acceptance",
+    )
     def test_live_acceptance_is_explicitly_opt_in(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(LIVE_ACCEPTANCE)],
@@ -273,6 +278,10 @@ class CredentialProvisioningBoundaryTests(unittest.TestCase):
         self.assertIn("--confirm-disposable-synthetic-rbac-run", completed.stdout)
 
 
+@unittest.skipUnless(
+    RUN_EXTERNAL_TESTS,
+    "requires Docker Compose; enabled by manual live acceptance",
+)
 class ComposeCredentialBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

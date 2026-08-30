@@ -16,7 +16,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 LEGAL_HARNESS = ROOT / "infra/minio/tests/live_legal_hold_mediation_acceptance.py"
-EXPECTED_LEGAL_HARNESS_SHA256 = "504f57f13390ea26b14a502f92139a9d4e71c34cb0e8b82d5e578360f64ff5c6"
+EXPECTED_LEGAL_HARNESS_SHA256 = "0d50e5c0b3420a2e015b2e2bdfc78a02533f2326dc887248681b87cc62182d0e"
 CONFIRM_FLAG = "--confirm-disposable-synthetic-retention-enforcement-run"
 RETENTION_IMAGE_FLAG = "--retention-image"
 LEGAL_IMAGE_FLAG = "--legal-hold-image"

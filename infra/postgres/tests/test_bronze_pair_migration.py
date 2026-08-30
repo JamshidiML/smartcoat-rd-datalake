@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
@@ -10,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[3]
 MIGRATIONS = ROOT / "infra/postgres/migrations"
 MIGRATION = MIGRATIONS / "0008__enforce_bronze_pair_commit_and_orphans.sql"
 LIVE_ACCEPTANCE = MIGRATIONS.parent / "tests/live_bronze_pair_acceptance.py"
+RUN_EXTERNAL_TESTS = os.environ.get("SMARTCOAT_EXTERNAL_TESTS") == "1"
 
 
 class BronzePairMigrationTests(unittest.TestCase):
@@ -78,6 +80,10 @@ class BronzePairMigrationTests(unittest.TestCase):
         for forbidden in ("delete from bronze", "legal hold off", "set_object_retention"):
             self.assertNotIn(forbidden, lowered)
 
+    @unittest.skipUnless(
+        RUN_EXTERNAL_TESTS,
+        "requires an external Python process; enabled by manual live acceptance",
+    )
     def test_live_acceptance_is_explicitly_opt_in(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(LIVE_ACCEPTANCE)],

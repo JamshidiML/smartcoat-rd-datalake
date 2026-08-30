@@ -28,6 +28,8 @@ jobs:
       - name: Validate contracts and Compose syntax
         run: python apps/api/tests/validate_repository.py
       - name: Run offline infrastructure tests
+        env:
+          SMARTCOAT_EXTERNAL_TESTS: "0"
         run: |
           python -m unittest discover -s infra/minio/tests -p 'test_*.py' -v
           python -m unittest discover -s infra/network/tests -p 'test_*.py' -v

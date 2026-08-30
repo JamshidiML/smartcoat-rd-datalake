@@ -42,6 +42,13 @@ jobs:
         run: test "$CONFIRM_DISPOSABLE_RUN" = "CONFIRM_DISPOSABLE_SYNTHETIC_LIVE_ACCEPTANCE"
       - name: Build native application images manually
         run: docker compose --env-file .env.example build api web
+      - name: Run external-dependent infrastructure contract tests
+        env:
+          SMARTCOAT_EXTERNAL_TESTS: "1"
+        run: |
+          python3 -m unittest discover -s infra/postgres/tests -p 'test_bronze_pair_migration.py' -v
+          python3 -m unittest discover -s infra/postgres/tests -p 'test_migration_operations.py' -v
+          python3 -m unittest discover -s infra/postgres/tests -p 'test_postgres_rbac.py' -v
       - name: Run integrated migration lifecycle acceptance
         run: python3 infra/postgres/tests/live_integrated_wave1_migration_acceptance.py lifecycle --confirm-disposable-synthetic-run
       - name: Run integrated migration lock acceptance
