@@ -128,7 +128,9 @@ class MinioExactVersionRetentionStorage:
             from minio.error import S3Error
             from minio.retention import Retention
 
-            retention_factory = lambda retain_until: Retention(COMPLIANCE, retain_until)
+            def retention_factory(retain_until: datetime) -> Any:
+                return Retention(COMPLIANCE, retain_until)
+
             s3_error_type = S3Error
         self.client = client
         self.retention_factory = retention_factory

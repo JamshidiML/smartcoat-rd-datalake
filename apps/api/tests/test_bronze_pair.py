@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sys
 import unittest
-from copy import deepcopy
 from pathlib import Path
 from typing import Any
 

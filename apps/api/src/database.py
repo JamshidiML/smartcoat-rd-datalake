@@ -1014,10 +1014,10 @@ class PostgresRepository:
         except psycopg.errors.UniqueViolation as exc:
             try:
                 return self._replay_review_after_unique_conflict(decision)
-            except StateConflict as conflict:
+            except StateConflict:
                 raise StateConflict(
                     "The Silver draft already has a different effective review outcome"
-                ) from conflict
+                ) from exc
 
     def max_silver_revision(self, ingestion_id: str) -> int:
         with self.connection() as connection:
