@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hmac
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from minio import Minio
@@ -13,6 +14,13 @@ from pydantic import BaseModel
 
 from database import PostgresRepository
 from domain import Actor, IngestionService, ReviewService, StateConflict
+from operational_logging import (
+    bind_correlation,
+    configure_service,
+    log_event,
+    new_correlation_id,
+    reset_correlation,
+)
 from retention_enforcement import (
     ExactVersionRetentionEnforcer,
     HttpLegalHoldMediator,
@@ -33,6 +41,8 @@ SESSION_SECRET = os.environ["SESSION_SECRET"]
 WEB_ORIGIN = os.getenv("WEB_ORIGIN", "http://127.0.0.1:8080")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 ALLOW_SOLO_REVIEW = os.getenv("ALLOW_PHASE_1_SOLO_SELF_REVIEW", "true").lower() == "true"
+
+configure_service("api")
 
 repository = PostgresRepository(DATABASE_URL)
 review_repository = PostgresRepository(REVIEW_DATABASE_URL)
@@ -74,6 +84,43 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def structured_request_logging(request: Request, call_next):
+    correlation_id = new_correlation_id()
+    token = bind_correlation(correlation_id)
+    started = time.perf_counter()
+    log_event(
+        "INFO",
+        "request.received",
+        method=request.method,
+        path=request.url.path,
+    )
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        log_event(
+            "ERROR",
+            "request.failed",
+            method=request.method,
+            path=request.url.path,
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            error_type=type(exc).__name__,
+        )
+        raise
+    else:
+        log_event(
+            "INFO",
+            "request.completed",
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+        return response
+    finally:
+        reset_correlation(token)
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -93,12 +140,25 @@ class RevisionRequest(BaseModel):
 
 def current_actor(authorization: Annotated[str | None, Header()] = None) -> Actor:
     if not authorization or not authorization.startswith("Bearer "):
+        log_event("WARNING", "auth.session.rejected", reason="MISSING_BEARER_TOKEN")
         raise HTTPException(status_code=401, detail="Authentication required")
     try:
         user_id = verify_session(authorization.removeprefix("Bearer "), SESSION_SECRET)
     except InvalidSession as exc:
+        log_event(
+            "WARNING",
+            "auth.session.rejected",
+            reason="INVALID_SESSION",
+            error_type=type(exc).__name__,
+        )
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     if user_id != LOCAL_USER_ID:
+        log_event(
+            "WARNING",
+            "auth.session.rejected",
+            actor_id=user_id,
+            reason="UNKNOWN_LOCAL_USER",
+        )
         raise HTTPException(status_code=403, detail="Unknown local user")
     return Actor(LOCAL_USER_ID, LOCAL_USER_DISPLAY_NAME)
 
@@ -125,6 +185,7 @@ def readiness() -> dict[str, str]:
     with review_repository.connection() as connection:
         connection.execute("SELECT 1")
     if not minio_client.bucket_exists("sc-rd-bronze-manifests"):
+        log_event("ERROR", "readiness.rejected", reason="MANIFEST_BUCKET_UNAVAILABLE")
         raise HTTPException(status_code=503, detail="Bronze manifest bucket unavailable")
     return {"status": "ok"}
 
@@ -134,7 +195,9 @@ def login(request: LoginRequest) -> dict[str, str]:
     email_ok = hmac.compare_digest(request.email.lower(), LOCAL_USER_EMAIL.lower())
     password_ok = hmac.compare_digest(request.password, LOCAL_USER_PASSWORD)
     if not (email_ok and password_ok):
+        log_event("WARNING", "auth.login.rejected", reason="INVALID_LOCAL_CREDENTIALS")
         raise HTTPException(status_code=401, detail="Invalid local credentials")
+    log_event("INFO", "auth.login.completed", actor_id=LOCAL_USER_ID)
     return {
         "access_token": issue_session(LOCAL_USER_ID, SESSION_SECRET),
         "token_type": "bearer",
@@ -164,8 +227,23 @@ async def upload(
             )
         )
     except UploadValidationError as exc:
+        log_event(
+            "WARNING",
+            "upload.validation.rejected",
+            actor_id=actor.user_id,
+            reason=exc.reason,
+            validation_code=exc.code,
+            error_type=type(exc).__name__,
+        )
         raise HTTPException(status_code=422, detail={"code": exc.code, "reason": exc.reason}) from exc
     except StateConflict as exc:
+        log_event(
+            "WARNING",
+            "upload.state_conflict.rejected",
+            actor_id=actor.user_id,
+            reason=str(exc),
+            error_type=type(exc).__name__,
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -179,6 +257,12 @@ def source(ingestion_id: str, _: Annotated[Actor, Depends(current_actor)]) -> Re
     record = repository.get_upload(ingestion_id)
     version_id = record.get("original_object_version_id")
     if not version_id:
+        log_event(
+            "WARNING",
+            "source.validation.rejected",
+            ingestion_id=ingestion_id,
+            reason="EXACT_BRONZE_VERSION_UNAVAILABLE",
+        )
         raise HTTPException(status_code=409, detail="Exact Bronze source version unavailable")
     data = storage.get_exact(
         "sc-rd-bronze-originals", record["stored_object_key"], version_id
@@ -199,6 +283,13 @@ def reconcile_bronze(
     try:
         return serializable(ingestion_service.reconcile(ingestion_id))
     except StateConflict as exc:
+        log_event(
+            "WARNING",
+            "bronze.reconciliation.rejected",
+            ingestion_id=ingestion_id,
+            reason=str(exc),
+            error_type=type(exc).__name__,
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -230,6 +321,14 @@ def review(
         )
         return serializable(result or {"status": "REVIEW_REJECTED"})
     except (ValueError, StateConflict) as exc:
+        log_event(
+            "WARNING",
+            "review.validation.rejected",
+            draft_id=draft_id,
+            actor_id=actor.user_id,
+            reason=str(exc),
+            error_type=type(exc).__name__,
+        )
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
@@ -242,4 +341,12 @@ def revise(
     try:
         return serializable(review_service.edit_verified(ingestion_id, actor, request.text))
     except StateConflict as exc:
+        log_event(
+            "WARNING",
+            "revision.validation.rejected",
+            ingestion_id=ingestion_id,
+            actor_id=actor.user_id,
+            reason=str(exc),
+            error_type=type(exc).__name__,
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc

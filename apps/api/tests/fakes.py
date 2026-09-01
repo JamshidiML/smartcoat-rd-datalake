@@ -226,7 +226,9 @@ class MemoryRepository:
         upload["state"] = new_state
         self._audit(ingestion_id, "UPLOAD_STATE_CHANGED", previous_state, new_state, actor, details)
 
-    def ensure_ocr_queued(self, ingestion_id: str) -> str:
+    def ensure_ocr_queued(
+        self, ingestion_id: str, correlation_id: str | None = None
+    ) -> str:
         existing = next(
             (job for job in self.jobs.values() if job["ingestion_id"] == ingestion_id),
             None,
@@ -235,7 +237,7 @@ class MemoryRepository:
             return existing["ocr_job_id"]
         if ingestion_id not in self.pairs or self.uploads[ingestion_id]["state"] != "BRONZE_COMMITTED":
             raise StateConflict("OCR cannot be queued before a successful Bronze pair commit")
-        job_id = uuid7()
+        job_id = correlation_id or uuid7()
         self.jobs[job_id] = {"ocr_job_id": job_id, "ingestion_id": ingestion_id, "status": "QUEUED"}
         self.uploads[ingestion_id]["state"] = "OCR_QUEUED"
         self._audit(
