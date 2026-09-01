@@ -10,6 +10,10 @@ MIGRATION = (
     ROOT
     / "infra/postgres/migrations/0003__enforce_upload_state_transitions.sql"
 )
+RECOVERY_MIGRATION = (
+    ROOT
+    / "infra/postgres/migrations/0009__add_operator_ocr_retry_transition.sql"
+)
 INIT_SQL = ROOT / "infra/postgres/init.sql"
 
 STATES = (
@@ -30,6 +34,7 @@ LEGAL_TRANSITIONS = {
     ("BRONZE_COMMITTED", "OCR_QUEUED"),
     ("OCR_QUEUED", "OCR_COMPLETED"),
     ("OCR_QUEUED", "OCR_FAILED"),
+    ("OCR_FAILED", "OCR_QUEUED"),
     ("OCR_COMPLETED", "SILVER_DRAFT_READY"),
     ("SILVER_DRAFT_READY", "UNDER_HUMAN_REVIEW"),
     ("UNDER_HUMAN_REVIEW", "VERIFIED"),
@@ -51,10 +56,12 @@ class StateTransitionMigrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.sql = MIGRATION.read_text(encoding="utf-8")
+        cls.recovery_sql = RECOVERY_MIGRATION.read_text(encoding="utf-8")
+        cls.combined_sql = cls.sql + "\n" + cls.recovery_sql
 
     def test_migration_installs_the_exact_frozen_graph(self) -> None:
-        self.assertEqual(LEGAL_TRANSITIONS, installed_edges(self.sql))
-        self.assertEqual(10, len(LEGAL_TRANSITIONS))
+        self.assertEqual(LEGAL_TRANSITIONS, installed_edges(self.combined_sql))
+        self.assertEqual(11, len(LEGAL_TRANSITIONS))
         self.assertEqual(set(STATES), {state for edge in LEGAL_TRANSITIONS for state in edge})
 
     def test_every_changed_state_pair_is_unambiguously_legal_or_illegal(self) -> None:
@@ -65,12 +72,20 @@ class StateTransitionMigrationTests(unittest.TestCase):
             if previous != following
         }
         self.assertEqual(90, len(changed_pairs))
-        self.assertEqual(10, len(changed_pairs & LEGAL_TRANSITIONS))
-        self.assertEqual(80, len(changed_pairs - LEGAL_TRANSITIONS))
+        self.assertEqual(11, len(changed_pairs & LEGAL_TRANSITIONS))
+        self.assertEqual(79, len(changed_pairs - LEGAL_TRANSITIONS))
 
     def test_terminal_states_have_no_outgoing_edges(self) -> None:
         outgoing = {previous for previous, _following in LEGAL_TRANSITIONS}
-        self.assertTrue({"REJECTED", "OCR_FAILED", "REVIEW_REJECTED"}.isdisjoint(outgoing))
+        self.assertTrue({"REJECTED", "REVIEW_REJECTED"}.isdisjoint(outgoing))
+
+    def test_ocr_failed_has_only_the_operator_retry_edge(self) -> None:
+        self.assertEqual(
+            {("OCR_FAILED", "OCR_QUEUED")},
+            {edge for edge in LEGAL_TRANSITIONS if edge[0] == "OCR_FAILED"},
+        )
+        self.assertIn("operator_retry_failed_ocr", self.recovery_sql)
+        self.assertNotIn("SILVER_DRAFT_READY", self.recovery_sql)
 
     def test_verified_has_only_the_revision_edge(self) -> None:
         self.assertEqual(
@@ -117,6 +132,8 @@ class StateTransitionMigrationTests(unittest.TestCase):
         self.assertEqual(set(STATES), init_states)
         self.assertNotIn("ALTER TABLE public.uploads", self.sql)
         self.assertNotIn("UPDATE public.uploads", self.sql)
+        self.assertNotIn("ALTER TABLE public.uploads", self.recovery_sql)
+        self.assertNotIn("UPDATE public.uploads", self.recovery_sql)
 
 
 if __name__ == "__main__":

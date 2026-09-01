@@ -327,6 +327,7 @@ class ComposeCredentialBoundaryTests(unittest.TestCase):
         api = self.services["api"]["environment"]
         worker = self.services["ocr-worker"]["environment"]
         self.assertEqual(self.environment["DATABASE_INGESTION_URL"], api["DATABASE_URL"])
+        self.assertEqual(self.environment["DATABASE_OCR_URL"], api["OCR_DATABASE_URL"])
         self.assertEqual(self.environment["DATABASE_REVIEW_URL"], api["REVIEW_DATABASE_URL"])
         self.assertEqual(self.environment["DATABASE_OCR_URL"], worker["DATABASE_URL"])
         for runtime in (api, worker):
@@ -357,6 +358,8 @@ class ComposeCredentialBoundaryTests(unittest.TestCase):
         worker = (ROOT / "apps/ocr-worker/src/jobs/worker.py").read_text()
         restore = (ROOT / "scripts/restore-drill.sh").read_text()
         self.assertIn('REVIEW_DATABASE_URL = os.environ["REVIEW_DATABASE_URL"]', main)
+        self.assertIn('OCR_DATABASE_URL = os.environ["OCR_DATABASE_URL"]', main)
+        self.assertIn("OCRRecoveryService(ocr_repository", main)
         self.assertIn("ReviewService(review_repository", main)
         self.assertIn("with review_repository.connection() as connection:", main)
         self.assertIn('PostgresRepository(os.environ["DATABASE_URL"])', worker)

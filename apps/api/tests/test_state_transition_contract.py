@@ -36,6 +36,7 @@ LEGAL_TRANSITIONS = {
     ("BRONZE_COMMITTED", "OCR_QUEUED"),
     ("OCR_QUEUED", "OCR_COMPLETED"),
     ("OCR_QUEUED", "OCR_FAILED"),
+    ("OCR_FAILED", "OCR_QUEUED"),
     ("OCR_COMPLETED", "SILVER_DRAFT_READY"),
     ("SILVER_DRAFT_READY", "UNDER_HUMAN_REVIEW"),
     ("UNDER_HUMAN_REVIEW", "VERIFIED"),
@@ -190,7 +191,7 @@ class StateTransitionServiceBoundaryTests(unittest.TestCase):
 
     def test_terminal_states_reject_all_follow_up_calls(self) -> None:
         ingestion_id = "00000000-0000-0000-0000-000000000001"
-        for terminal in ("REJECTED", "OCR_FAILED", "REVIEW_REJECTED"):
+        for terminal in ("REJECTED", "REVIEW_REJECTED"):
             for following in STATES:
                 if following == terminal:
                     continue
@@ -203,6 +204,12 @@ class StateTransitionServiceBoundaryTests(unittest.TestCase):
                             following,
                             "system",
                         )
+
+    def test_ocr_failed_has_only_the_operator_retry_edge(self) -> None:
+        self.assertEqual(
+            {("OCR_FAILED", "OCR_QUEUED")},
+            {edge for edge in LEGAL_TRANSITIONS if edge[0] == "OCR_FAILED"},
+        )
 
 
 if __name__ == "__main__":

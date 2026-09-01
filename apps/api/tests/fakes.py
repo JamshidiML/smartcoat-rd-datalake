@@ -238,13 +238,63 @@ class MemoryRepository:
         if ingestion_id not in self.pairs or self.uploads[ingestion_id]["state"] != "BRONZE_COMMITTED":
             raise StateConflict("OCR cannot be queued before a successful Bronze pair commit")
         job_id = correlation_id or uuid7()
-        self.jobs[job_id] = {"ocr_job_id": job_id, "ingestion_id": ingestion_id, "status": "QUEUED"}
+        self.jobs[job_id] = {
+            "ocr_job_id": job_id,
+            "ingestion_id": ingestion_id,
+            "status": "QUEUED",
+            "attempt_count": 0,
+            "error_reason": None,
+        }
         self.uploads[ingestion_id]["state"] = "OCR_QUEUED"
         self._audit(
             ingestion_id, "UPLOAD_STATE_CHANGED", "BRONZE_COMMITTED",
             "OCR_QUEUED", "system", {"ocr_job_id": job_id},
         )
         return job_id
+
+    def retry_failed_ocr(
+        self, ingestion_id: str, actor_id: str, max_attempts: int
+    ) -> dict[str, Any]:
+        job = next(
+            value for value in self.jobs.values()
+            if value["ingestion_id"] == ingestion_id
+        )
+        if self.uploads[ingestion_id]["state"] != "OCR_FAILED" or job["status"] != "FAILED":
+            raise StateConflict("Only a failed OCR job can be retried")
+        if job["attempt_count"] >= max_attempts:
+            raise StateConflict(
+                f"OCR retry limit reached ({max_attempts} attempts); operator review is required"
+            )
+        original = next(
+            item for item in self.objects
+            if item["ingestion_id"] == ingestion_id and item["kind"] == "ORIGINAL"
+        )
+        previous_error = job["error_reason"]
+        job.update(status="QUEUED", error_reason=None)
+        self.uploads[ingestion_id]["state"] = "OCR_QUEUED"
+        details = {
+            "ingestion_id": ingestion_id,
+            "attempt_count": job["attempt_count"],
+            "max_attempts": max_attempts,
+            "previous_error_reason": previous_error,
+            "original_object_version_id": original["version_id"],
+        }
+        self._audit(
+            job["ocr_job_id"], "OCR_RETRY_INITIATED", "FAILED", "QUEUED",
+            actor_id, details,
+        )
+        self._audit(
+            ingestion_id, "UPLOAD_STATE_CHANGED", "OCR_FAILED", "OCR_QUEUED",
+            actor_id, details,
+        )
+        return {
+            "ingestion_id": ingestion_id,
+            "ocr_job_id": job["ocr_job_id"],
+            "status": "QUEUED",
+            "attempt_count": job["attempt_count"],
+            "max_attempts": max_attempts,
+            "original_object_version_id": original["version_id"],
+        }
 
     def get_upload(self, ingestion_id: str) -> dict[str, Any]:
         return self.uploads[ingestion_id]
@@ -254,6 +304,7 @@ class MemoryRepository:
         if job["status"] != "QUEUED":
             raise StateConflict("job is not queued")
         job["status"] = "RUNNING"
+        job["attempt_count"] += 1
         self.runs[run["ocr_run_id"]] = {**deepcopy(run), "status": "RUNNING", "ocr_job_id": job["ocr_job_id"]}
 
     def complete_ocr_run(self, ingestion_id: str, run: dict[str, Any], draft: dict[str, Any]) -> None:
@@ -265,6 +316,42 @@ class MemoryRepository:
             **deepcopy(draft),
             "raw_artifact_key": run["raw_artifact_key"],
         }
+
+    def mark_ocr_failed(self, ingestion_id: str, reason: str) -> None:
+        job = next(
+            value for value in self.jobs.values()
+            if value["ingestion_id"] == ingestion_id
+        )
+        original = next(
+            item for item in self.objects
+            if item["ingestion_id"] == ingestion_id and item["kind"] == "ORIGINAL"
+        )
+        running = next(
+            (
+                run for run in self.runs.values()
+                if run["ocr_job_id"] == job["ocr_job_id"] and run["status"] == "RUNNING"
+            ),
+            None,
+        )
+        if running:
+            running["status"] = "FAILED"
+        job.update(status="FAILED", error_reason=reason)
+        self.uploads[ingestion_id]["state"] = "OCR_FAILED"
+        details = {
+            "ingestion_id": ingestion_id,
+            "attempt_count": job["attempt_count"],
+            "error_reason": reason,
+            "ocr_run_id": running["ocr_run_id"] if running else None,
+            "original_object_version_id": original["version_id"],
+        }
+        self._audit(
+            job["ocr_job_id"], "OCR_JOB_FAILED", "RUNNING", "FAILED",
+            "ocr-worker", details,
+        )
+        self._audit(
+            ingestion_id, "UPLOAD_STATE_CHANGED", "OCR_QUEUED", "OCR_FAILED",
+            "ocr-worker", details,
+        )
 
     def get_draft(self, draft_id: str) -> dict[str, Any]:
         return self.drafts[draft_id]

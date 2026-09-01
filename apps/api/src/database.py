@@ -603,6 +603,94 @@ class PostgresRepository:
             )
         return job_id
 
+    def retry_failed_ocr(
+        self, ingestion_id: str, actor_id: str, max_attempts: int
+    ) -> dict[str, Any]:
+        with self.connection() as connection:
+            context = connection.execute(
+                """
+                SELECT upload_record.state, job.ocr_job_id, job.status,
+                    job.attempt_count, job.error_reason,
+                    original.object_version_id AS original_object_version_id
+                FROM uploads upload_record
+                JOIN ocr_jobs job USING (ingestion_id)
+                JOIN bronze_pairs pair_record USING (ingestion_id)
+                JOIN bronze_objects original
+                  ON original.bronze_object_id = pair_record.original_bronze_object_id
+                WHERE upload_record.ingestion_id = %s
+                FOR UPDATE OF upload_record, job
+                """,
+                (ingestion_id,),
+            ).fetchone()
+            if not context:
+                raise StateConflict("Failed OCR recovery context is incomplete")
+            if context["state"] != "OCR_FAILED" or context["status"] != "FAILED":
+                raise StateConflict("Only a failed OCR job can be retried")
+            if context["attempt_count"] >= max_attempts:
+                raise StateConflict(
+                    f"OCR retry limit reached ({max_attempts} attempts); operator review is required"
+                )
+
+            updated = connection.execute(
+                """
+                UPDATE ocr_jobs
+                SET status = 'QUEUED', started_at_utc = NULL,
+                    completed_at_utc = NULL, error_reason = NULL
+                WHERE ocr_job_id = %s AND status = 'FAILED'
+                """,
+                (context["ocr_job_id"],),
+            )
+            if updated.rowcount != 1:
+                raise StateConflict("Failed OCR job changed during retry")
+            self._audit(
+                connection,
+                actor_id,
+                "OCR_JOB",
+                str(context["ocr_job_id"]),
+                "OCR_RETRY_INITIATED",
+                "FAILED",
+                "QUEUED",
+                {
+                    "ingestion_id": ingestion_id,
+                    "attempt_count": context["attempt_count"],
+                    "max_attempts": max_attempts,
+                    "previous_error_reason": context["error_reason"],
+                    "original_object_version_id": context["original_object_version_id"],
+                },
+            )
+            transitioned = connection.execute(
+                """
+                UPDATE uploads SET state = 'OCR_QUEUED'
+                WHERE ingestion_id = %s AND state = 'OCR_FAILED'
+                """,
+                (ingestion_id,),
+            )
+            if transitioned.rowcount != 1:
+                raise StateConflict("OCR retry transition was not atomic")
+            self._audit(
+                connection,
+                actor_id,
+                "UPLOAD",
+                ingestion_id,
+                "UPLOAD_STATE_CHANGED",
+                "OCR_FAILED",
+                "OCR_QUEUED",
+                {
+                    "ocr_job_id": str(context["ocr_job_id"]),
+                    "attempt_count": context["attempt_count"],
+                    "max_attempts": max_attempts,
+                    "original_object_version_id": context["original_object_version_id"],
+                },
+            )
+        return {
+            "ingestion_id": ingestion_id,
+            "ocr_job_id": str(context["ocr_job_id"]),
+            "status": "QUEUED",
+            "attempt_count": context["attempt_count"],
+            "max_attempts": max_attempts,
+            "original_object_version_id": context["original_object_version_id"],
+        }
+
     def get_upload(self, ingestion_id: str) -> dict[str, Any]:
         with self.connection() as connection:
             row = connection.execute(
@@ -1206,13 +1294,88 @@ class PostgresRepository:
 
     def mark_ocr_failed(self, ingestion_id: str, reason: str) -> None:
         with self.connection() as connection:
-            connection.execute(
-                "UPDATE ocr_jobs SET status = 'FAILED', error_reason = %s, completed_at_utc = now() WHERE ingestion_id = %s AND status IN ('QUEUED', 'RUNNING')",
-                (reason[:1000], ingestion_id),
+            context = connection.execute(
+                """
+                SELECT upload_record.state, job.ocr_job_id, job.status,
+                    job.attempt_count,
+                    original.object_version_id AS original_object_version_id
+                FROM uploads upload_record
+                JOIN ocr_jobs job USING (ingestion_id)
+                JOIN bronze_pairs pair_record USING (ingestion_id)
+                JOIN bronze_objects original
+                  ON original.bronze_object_id = pair_record.original_bronze_object_id
+                WHERE upload_record.ingestion_id = %s
+                FOR UPDATE OF upload_record, job
+                """,
+                (ingestion_id,),
+            ).fetchone()
+            if not context or context["state"] != "OCR_QUEUED":
+                raise StateConflict("OCR failure context is incomplete")
+            failed_job = connection.execute(
+                """
+                UPDATE ocr_jobs SET status = 'FAILED', error_reason = %s,
+                    completed_at_utc = now()
+                WHERE ocr_job_id = %s AND status IN ('QUEUED', 'RUNNING')
+                """,
+                (reason[:1000], context["ocr_job_id"]),
             )
-            connection.execute(
-                "UPDATE ocr_runs SET status = 'FAILED', completed_at_utc = now() WHERE ingestion_id = %s AND status = 'RUNNING'",
+            if failed_job.rowcount != 1:
+                raise StateConflict("OCR job is not fail-able")
+            failed_run = connection.execute(
+                """
+                UPDATE ocr_runs SET status = 'FAILED', completed_at_utc = now()
+                WHERE ingestion_id = %s AND status = 'RUNNING'
+                RETURNING ocr_run_id
+                """,
+                (ingestion_id,),
+            ).fetchone()
+            self._audit(
+                connection,
+                "ocr-worker",
+                "OCR_JOB",
+                str(context["ocr_job_id"]),
+                "OCR_JOB_FAILED",
+                context["status"],
+                "FAILED",
+                {
+                    "ingestion_id": ingestion_id,
+                    "attempt_count": context["attempt_count"],
+                    "error_reason": reason[:1000],
+                    "ocr_run_id": (
+                        str(failed_run["ocr_run_id"]) if failed_run else None
+                    ),
+                    "original_object_version_id": context["original_object_version_id"],
+                },
+            )
+            transitioned = connection.execute(
+                """
+                UPDATE uploads SET state = 'OCR_FAILED'
+                WHERE ingestion_id = %s AND state = 'OCR_QUEUED'
+                """,
                 (ingestion_id,),
             )
-        upload = self.get_upload(ingestion_id)
-        self.transition(ingestion_id, upload["state"], "OCR_FAILED", "ocr-worker", {"reason": reason[:500]})
+            if transitioned.rowcount != 1:
+                raise StateConflict("OCR failure transition was not atomic")
+            self._audit(
+                connection,
+                "ocr-worker",
+                "UPLOAD",
+                ingestion_id,
+                "UPLOAD_STATE_CHANGED",
+                "OCR_QUEUED",
+                "OCR_FAILED",
+                {
+                    "ocr_job_id": str(context["ocr_job_id"]),
+                    "attempt_count": context["attempt_count"],
+                    "reason": reason[:500],
+                    "original_object_version_id": context["original_object_version_id"],
+                },
+            )
+        log_event(
+            "INFO",
+            "state.transition",
+            ingestion_id=ingestion_id,
+            actor_id="ocr-worker",
+            state_from="OCR_QUEUED",
+            state_to="OCR_FAILED",
+        )

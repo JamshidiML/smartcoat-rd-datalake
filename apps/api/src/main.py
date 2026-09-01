@@ -13,7 +13,13 @@ from minio import Minio
 from pydantic import BaseModel
 
 from database import PostgresRepository
-from domain import Actor, IngestionService, ReviewService, StateConflict
+from domain import (
+    Actor,
+    IngestionService,
+    OCRRecoveryService,
+    ReviewService,
+    StateConflict,
+)
 from operational_logging import (
     bind_correlation,
     configure_service,
@@ -32,6 +38,7 @@ from validation import UploadValidationError
 
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+OCR_DATABASE_URL = os.environ["OCR_DATABASE_URL"]
 REVIEW_DATABASE_URL = os.environ["REVIEW_DATABASE_URL"]
 LOCAL_USER_ID = os.getenv("LOCAL_USER_ID", "usr_founder")
 LOCAL_USER_DISPLAY_NAME = os.getenv("LOCAL_USER_DISPLAY_NAME", "SmartCoat Founder")
@@ -41,10 +48,12 @@ SESSION_SECRET = os.environ["SESSION_SECRET"]
 WEB_ORIGIN = os.getenv("WEB_ORIGIN", "http://127.0.0.1:8080")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 ALLOW_SOLO_REVIEW = os.getenv("ALLOW_PHASE_1_SOLO_SELF_REVIEW", "true").lower() == "true"
+OCR_MAX_ATTEMPTS = int(os.getenv("OCR_MAX_ATTEMPTS", "3"))
 
 configure_service("api")
 
 repository = PostgresRepository(DATABASE_URL)
+ocr_repository = PostgresRepository(OCR_DATABASE_URL)
 review_repository = PostgresRepository(REVIEW_DATABASE_URL)
 minio_client = Minio(
     os.getenv("MINIO_ENDPOINT", "minio:9000"),
@@ -64,6 +73,7 @@ ingestion_service = IngestionService(
     repository, storage, MAX_UPLOAD_BYTES, retention_enforcer
 )
 review_service = ReviewService(review_repository, ALLOW_SOLO_REVIEW)
+ocr_recovery_service = OCRRecoveryService(ocr_repository, OCR_MAX_ATTEMPTS)
 
 
 @asynccontextmanager
@@ -184,6 +194,8 @@ def readiness() -> dict[str, str]:
         connection.execute("SELECT 1")
     with review_repository.connection() as connection:
         connection.execute("SELECT 1")
+    with ocr_repository.connection() as connection:
+        connection.execute("SELECT 1")
     if not minio_client.bucket_exists("sc-rd-bronze-manifests"):
         log_event("ERROR", "readiness.rejected", reason="MANIFEST_BUCKET_UNAVAILABLE")
         raise HTTPException(status_code=503, detail="Bronze manifest bucket unavailable")
@@ -287,6 +299,25 @@ def reconcile_bronze(
             "WARNING",
             "bronze.reconciliation.rejected",
             ingestion_id=ingestion_id,
+            reason=str(exc),
+            error_type=type(exc).__name__,
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/uploads/{ingestion_id}/retry-ocr")
+def retry_ocr(
+    ingestion_id: str,
+    actor: Annotated[Actor, Depends(current_actor)],
+) -> dict[str, Any]:
+    try:
+        return serializable(ocr_recovery_service.retry(ingestion_id, actor))
+    except StateConflict as exc:
+        log_event(
+            "WARNING",
+            "upload.state_conflict.rejected",
+            ingestion_id=ingestion_id,
+            actor_id=actor.user_id,
             reason=str(exc),
             error_type=type(exc).__name__,
         )

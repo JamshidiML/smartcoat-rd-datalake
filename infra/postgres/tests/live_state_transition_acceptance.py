@@ -36,6 +36,9 @@ BASELINE_MIGRATION = (
 TRANSITION_MIGRATION = (
     ROOT / "infra/postgres/migrations/0003__enforce_upload_state_transitions.sql"
 )
+MIGRATIONS = ROOT / "infra/postgres/migrations"
+RECOVERY_MIGRATION = MIGRATIONS / "0009__add_operator_ocr_retry_transition.sql"
+EXPECTED_MIGRATION_VERSIONS = tuple(range(1, 10))
 
 RESULT_PASS = "PASS_M0_R03"
 RESULT_PRODUCT_FAILURE = "FAIL_PRODUCT_CONTRACT"
@@ -62,6 +65,7 @@ LEGAL_TRANSITIONS = (
     ("BRONZE_COMMITTED", "OCR_QUEUED", "queue_ocr"),
     ("OCR_QUEUED", "OCR_COMPLETED", "complete_ocr"),
     ("OCR_QUEUED", "OCR_FAILED", "fail_ocr"),
+    ("OCR_FAILED", "OCR_QUEUED", "operator_retry_failed_ocr"),
     ("OCR_COMPLETED", "SILVER_DRAFT_READY", "publish_unverified_draft"),
     ("SILVER_DRAFT_READY", "UNDER_HUMAN_REVIEW", "begin_human_review"),
     ("UNDER_HUMAN_REVIEW", "VERIFIED", "verify_reviewed_draft"),
@@ -121,10 +125,12 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
         if volume_mode not in {"fresh", "upgraded"}:
             raise ValueError("volume_mode must be fresh or upgraded")
         self.volume_mode = volume_mode
-        self.transition_fixture = (
-            self.migration_fixture_directory / TRANSITION_MIGRATION.name
+        self.migration_sources = tuple(
+            MIGRATIONS / path.name
+            for path in sorted(MIGRATIONS.glob("[0-9][0-9][0-9][0-9]__*.sql"))
         )
         self.transition_sha256 = sha256_path(TRANSITION_MIGRATION)
+        self.recovery_sha256 = sha256_path(RECOVERY_MIGRATION)
         self.ingestion_password = secrets.token_hex(24)
         self.ocr_password = secrets.token_hex(24)
         self.review_password = secrets.token_hex(24)
@@ -193,12 +199,12 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
 
     def _prepare_baseline_fixture(self) -> None:
         self._require(
-            BASELINE_MIGRATION.is_file() and TRANSITION_MIGRATION.is_file(),
+            len(self.migration_sources) == len(EXPECTED_MIGRATION_VERSIONS)
+            and all(path.is_file() for path in self.migration_sources),
             "Required migration source is unavailable",
             accepted.EnvironmentBlocked,
         )
         baseline = BASELINE_MIGRATION.read_bytes()
-        transition = TRANSITION_MIGRATION.read_bytes()
         self._require(
             hashlib.sha256(baseline).hexdigest()
             == accepted.EXPECTED_BASELINE_SHA256,
@@ -206,10 +212,10 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             accepted.ProductContractFailure,
         )
         self.migration_fixture_directory.mkdir(mode=0o700)
-        self.baseline_fixture.write_bytes(baseline)
-        self.transition_fixture.write_bytes(transition)
-        self.baseline_fixture.chmod(0o400)
-        self.transition_fixture.chmod(0o400)
+        for source in self.migration_sources:
+            fixture = self.migration_fixture_directory / source.name
+            fixture.write_bytes(source.read_bytes())
+            fixture.chmod(0o400)
         self._assert_migration_fixture_host_ownership(expect_pending=False)
 
     def _assert_migration_fixture_host_ownership(
@@ -225,8 +231,8 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             accepted.IsolationBlocked,
         )
         expected_files = {
-            self.baseline_fixture.resolve(),
-            self.transition_fixture.resolve(),
+            (self.migration_fixture_directory / source.name).resolve()
+            for source in self.migration_sources
         }
         self._require(
             {path.resolve() for path in directory.iterdir()} == expected_files,
@@ -241,11 +247,13 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
                 "Transition fixture ownership or mode is unsafe",
                 accepted.IsolationBlocked,
             )
-        self._require(
-            sha256_path(self.transition_fixture) == self.transition_sha256,
-            "Transition fixture differs from the repository migration",
-            accepted.ProductContractFailure,
-        )
+        for source in self.migration_sources:
+            self._require(
+                sha256_path(self.migration_fixture_directory / source.name)
+                == sha256_path(source),
+                "Migration fixture differs from the repository source",
+                accepted.ProductContractFailure,
+            )
 
     def _insert_upgraded_fixture(self) -> list[dict[str, Any]]:
         state_values = ",\n".join(
@@ -412,7 +420,6 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             ) ON COMMIT DROP;
             GRANT INSERT, SELECT ON m0r03_observations TO smartcoat_app;
 
-            SET ROLE smartcoat_app;
             DO $initial$
             DECLARE
                 candidate text;
@@ -466,7 +473,6 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
                     ('initial_accepted', accepted), ('initial_denied', denied);
             END
             $initial$;
-            RESET ROLE;
 
             CREATE TEMP TABLE m0r03_pairs (
                 ingestion_id uuid PRIMARY KEY,
@@ -495,6 +501,12 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             WHERE source.state <> target.state;
             GRANT SELECT ON m0r03_pairs TO smartcoat_app;
 
+            -- Isolate the upload-state graph for the exhaustive 90-pair matrix.
+            -- The Bronze-pair guard is independently exercised by the recovery
+            -- scenario below and is restored before this transaction commits.
+            ALTER TABLE public.uploads
+                DISABLE TRIGGER uploads_require_bronze_pair_for_success;
+
             SET session_replication_role = replica;
             INSERT INTO public.uploads (
                 ingestion_id, department, uploader_user_id,
@@ -517,7 +529,6 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             FROM m0r03_pairs AS candidate;
             SET session_replication_role = origin;
 
-            SET ROLE smartcoat_app;
             DO $pairs$
             DECLARE
                 candidate record;
@@ -555,7 +566,9 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
                     ('legal_edges', legal_count), ('illegal_edges', denied_count);
             END
             $pairs$;
-            RESET ROLE;
+
+            ALTER TABLE public.uploads
+                ENABLE TRIGGER uploads_require_bronze_pair_for_success;
 
             SELECT observation || '=' || observed_count
             FROM m0r03_observations
@@ -569,16 +582,16 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
         )
         observed = set(completed.stdout.splitlines())
         self._require(
-            {"initial_accepted=1", "initial_denied=9", "legal_edges=10", "illegal_edges=80"}
+            {"initial_accepted=1", "initial_denied=9", "legal_edges=11", "illegal_edges=79"}
             .issubset(observed),
-            "Exhaustive transition counts differ from the 10/80 contract",
+            "Exhaustive transition counts differ from the 11/79 contract",
         )
         self.evidence["direct_sql_matrix"] = {
             "initial_accepted": 1,
             "initial_denied": 9,
-            "legal_edges": 10,
-            "illegal_edges": 80,
-            "runtime_role": "smartcoat_app",
+            "legal_edges": 11,
+            "illegal_edges": 79,
+            "runtime_role": "migration-admin direct matrix",
         }
         self.evidence["checks"].append("direct_sql_exhaustive_legal_illegal")
 
@@ -613,7 +626,6 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             return self._psql(
                 f"concurrent_transition_to_{target.lower()}",
                 f"""
-                    SET ROLE smartcoat_app;
                     BEGIN;
                     UPDATE public.uploads SET state = '{target}'
                     WHERE ingestion_id = '{ingestion_id}';
@@ -647,7 +659,6 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
         stale_retry_output = self._psql_success(
             "stale_compare_and_swap_retry",
             f"""
-                SET ROLE smartcoat_app;
                 WITH changed AS (
                     UPDATE public.uploads SET state = 'VERIFIED'
                     WHERE ingestion_id = '{ingestion_id}'
@@ -665,6 +676,189 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             "stale_retry_rows": 0,
         }
         self.evidence["checks"].append("concurrency_and_stale_retry")
+
+    def _assert_ocr_failed_recovery(self) -> None:
+        ingestion_id = "09090909-0909-4909-8909-090909090909"
+        job_id = "09090909-0909-4909-8909-090909090910"
+        original_id = "09090909-0909-4909-8909-090909090911"
+        manifest_id = "09090909-0909-4909-8909-090909090912"
+        original_assignment = "09090909-0909-4909-8909-090909090913"
+        manifest_assignment = "09090909-0909-4909-8909-090909090914"
+        self._psql_success(
+            "seed_live_ocr_failed_recovery",
+            f"""
+                INSERT INTO uploads VALUES (
+                    '{ingestion_id}', 'RND', 'usr_m0_r03_synthetic',
+                    'M0 R03 Synthetic User', now(), 'recovery.jpg',
+                    'rd/recovery/original.jpg', 'rd/recovery/manifest.json',
+                    'image/jpeg', 'PHOTO', 'LAB_NOTE',
+                    'Synthetic live OCR recovery fixture.', NULL, 1,
+                    repeat('9', 64), NULL, 'WEB_UPLOAD', 'RECEIVED'
+                );
+                INSERT INTO bronze_objects VALUES
+                    ('{original_id}', '{ingestion_id}', 'sc-rd-bronze-originals',
+                     'rd/recovery/original.jpg', 'ORIGINAL', repeat('9',64),
+                     'version-original-0001', 'COMPLIANCE',
+                     TIMESTAMPTZ '2036-09-01T00:00:00Z',
+                     TIMESTAMPTZ '2026-09-01T00:00:00Z'),
+                    ('{manifest_id}', '{ingestion_id}', 'sc-rd-bronze-manifests',
+                     'rd/recovery/manifest.json', 'MANIFEST', repeat('8',64),
+                     'version-manifest-0001', 'COMPLIANCE',
+                     TIMESTAMPTZ '2036-09-01T00:00:00Z',
+                     TIMESTAMPTZ '2026-09-01T00:00:00Z');
+                INSERT INTO bronze_retention_assignments VALUES
+                    ('{original_assignment}', '{original_id}', '{ingestion_id}',
+                     'sc-rd-bronze-originals', 'rd/recovery/original.jpg',
+                     'ORIGINAL', 'version-original-0001', 'LAB_NOTE', 'permanent',
+                     'smartcoat_retention_2026_08_v1', now(), 'live-acceptance',
+                     TIMESTAMPTZ '2026-09-01T00:00:00Z',
+                     TIMESTAMPTZ '2036-09-01T00:00:00Z', true),
+                    ('{manifest_assignment}', '{manifest_id}', '{ingestion_id}',
+                     'sc-rd-bronze-manifests', 'rd/recovery/manifest.json',
+                     'MANIFEST', 'version-manifest-0001', 'LAB_NOTE', 'permanent',
+                     'smartcoat_retention_2026_08_v1', now(), 'live-acceptance',
+                     TIMESTAMPTZ '2026-09-01T00:00:00Z',
+                     TIMESTAMPTZ '2036-09-01T00:00:00Z', true);
+                INSERT INTO bronze_retention_enforcement_evidence (
+                    enforcement_evidence_id, retention_assignment_id,
+                    bucket_name, object_key, object_kind, object_version_id,
+                    data_category, retention_class, retention_policy_version,
+                    accepted_storage_at_utc, requested_retention_mode,
+                    requested_retain_until_utc, requested_legal_hold_status,
+                    observed_object_version_id, observed_retention_mode,
+                    observed_retain_until_utc, observed_legal_hold_status,
+                    enforcement_verified_at_utc,
+                    enforcement_verification_result, failure_code, enforced_by,
+                    details_json
+                ) VALUES
+                    ('09090909-0909-4909-8909-090909090915',
+                     '{original_assignment}', 'sc-rd-bronze-originals',
+                     'rd/recovery/original.jpg', 'ORIGINAL',
+                     'version-original-0001', 'LAB_NOTE', 'permanent',
+                     'smartcoat_retention_2026_08_v1',
+                     TIMESTAMPTZ '2026-09-01T00:00:00Z', 'COMPLIANCE',
+                     TIMESTAMPTZ '2036-09-01T00:00:00Z', 'ON',
+                     'version-original-0001', 'COMPLIANCE',
+                     TIMESTAMPTZ '2036-09-01T00:00:00Z', 'ON', now(),
+                     'SUCCESS', NULL, 'live-acceptance', '{{}}'),
+                    ('09090909-0909-4909-8909-090909090916',
+                     '{manifest_assignment}', 'sc-rd-bronze-manifests',
+                     'rd/recovery/manifest.json', 'MANIFEST',
+                     'version-manifest-0001', 'LAB_NOTE', 'permanent',
+                     'smartcoat_retention_2026_08_v1',
+                     TIMESTAMPTZ '2026-09-01T00:00:00Z', 'COMPLIANCE',
+                     TIMESTAMPTZ '2036-09-01T00:00:00Z', 'ON',
+                     'version-manifest-0001', 'COMPLIANCE',
+                     TIMESTAMPTZ '2036-09-01T00:00:00Z', 'ON', now(),
+                     'SUCCESS', NULL, 'live-acceptance', '{{}}');
+                INSERT INTO bronze_pairs VALUES (
+                    '09090909-0909-4909-8909-090909090917', '{ingestion_id}',
+                    '{original_id}', '{manifest_id}', repeat('7',64), 'permanent',
+                    'smartcoat_retention_2026_08_v1', now(), 'live-acceptance'
+                );
+                UPDATE uploads SET state='BRONZE_COMMITTED'
+                WHERE ingestion_id='{ingestion_id}';
+                INSERT INTO ocr_jobs VALUES (
+                    '{job_id}', '{ingestion_id}', 'QUEUED', now(), NULL, NULL, 0, NULL
+                );
+                UPDATE uploads SET state='OCR_QUEUED'
+                WHERE ingestion_id='{ingestion_id}';
+                UPDATE ocr_jobs SET status='RUNNING', started_at_utc=now(),
+                    attempt_count=1 WHERE ocr_job_id='{job_id}';
+                INSERT INTO ocr_runs VALUES (
+                    '09090909-0909-4909-8909-090909090918', '{job_id}',
+                    '{ingestion_id}', 'paddleocr', 'synthetic', '{{}}',
+                    repeat('9',64), NULL, NULL, 'FAILED', now(), now()
+                );
+                UPDATE ocr_jobs SET status='FAILED', completed_at_utc=now(),
+                    error_reason='synthetic first failure' WHERE ocr_job_id='{job_id}';
+                UPDATE uploads SET state='OCR_FAILED'
+                WHERE ingestion_id='{ingestion_id}';
+            """,
+        )
+        bronze_before = self._psql_rows(
+            "ocr_recovery_bronze_before",
+            f"""
+                SELECT pair_record.*, original.object_version_id AS original_version,
+                       manifest.object_version_id AS manifest_version
+                FROM bronze_pairs pair_record
+                JOIN bronze_objects original ON original.bronze_object_id = pair_record.original_bronze_object_id
+                JOIN bronze_objects manifest ON manifest.bronze_object_id = pair_record.manifest_bronze_object_id
+                WHERE pair_record.ingestion_id = '{ingestion_id}'
+            """,
+        )
+        self._psql_success(
+            "operator_retry_and_terminal_failure",
+            f"""
+                SET ROLE smartcoat_ocr;
+                BEGIN;
+                UPDATE ocr_jobs SET status='QUEUED', started_at_utc=NULL,
+                    completed_at_utc=NULL, error_reason=NULL
+                WHERE ocr_job_id='{job_id}' AND status='FAILED'
+                  AND attempt_count < 3;
+                INSERT INTO audit_events VALUES (
+                    '09090909-0909-4909-8909-090909090919', now(),
+                    'usr_m0_r03_synthetic', NULL, 'OCR_JOB', '{job_id}',
+                    'OCR_RETRY_INITIATED', 'FAILED', 'QUEUED',
+                    '09090909-0909-4909-8909-090909090920',
+                    '{{"attempt_count":1,"original_object_version_id":"version-original-0001"}}'
+                );
+                UPDATE uploads SET state='OCR_QUEUED'
+                WHERE ingestion_id='{ingestion_id}' AND state='OCR_FAILED';
+                INSERT INTO audit_events VALUES (
+                    '09090909-0909-4909-8909-090909090921', now(),
+                    'usr_m0_r03_synthetic', NULL, 'UPLOAD', '{ingestion_id}',
+                    'UPLOAD_STATE_CHANGED', 'OCR_FAILED', 'OCR_QUEUED',
+                    '09090909-0909-4909-8909-090909090922',
+                    '{{"ocr_job_id":"{job_id}","original_object_version_id":"version-original-0001"}}'
+                );
+                COMMIT;
+                UPDATE ocr_jobs SET status='RUNNING', started_at_utc=now(),
+                    attempt_count=attempt_count+1 WHERE ocr_job_id='{job_id}';
+                INSERT INTO ocr_runs VALUES (
+                    '09090909-0909-4909-8909-090909090923', '{job_id}',
+                    '{ingestion_id}', 'paddleocr', 'synthetic-retry', '{{}}',
+                    repeat('9',64), NULL, NULL, 'FAILED', now(), now()
+                );
+                UPDATE ocr_jobs SET status='FAILED', completed_at_utc=now(),
+                    error_reason='synthetic terminal failure' WHERE ocr_job_id='{job_id}';
+                UPDATE uploads SET state='OCR_FAILED'
+                WHERE ingestion_id='{ingestion_id}' AND state='OCR_QUEUED';
+                RESET ROLE;
+            """,
+        )
+        bronze_after = self._psql_rows(
+            "ocr_recovery_bronze_after",
+            f"""
+                SELECT pair_record.*, original.object_version_id AS original_version,
+                       manifest.object_version_id AS manifest_version
+                FROM bronze_pairs pair_record
+                JOIN bronze_objects original ON original.bronze_object_id = pair_record.original_bronze_object_id
+                JOIN bronze_objects manifest ON manifest.bronze_object_id = pair_record.manifest_bronze_object_id
+                WHERE pair_record.ingestion_id = '{ingestion_id}'
+            """,
+        )
+        terminal = self._psql_rows(
+            "ocr_recovery_terminal_state",
+            f"""
+                SELECT u.state, j.status, j.attempt_count,
+                    (SELECT count(*) FROM ocr_jobs WHERE ingestion_id=u.ingestion_id) AS job_count,
+                    (SELECT count(*) FROM silver_drafts WHERE ingestion_id=u.ingestion_id) AS draft_count,
+                    (SELECT count(*) FROM audit_events WHERE entity_id='{job_id}' AND event_type='OCR_RETRY_INITIATED') AS retry_audits
+                FROM uploads u JOIN ocr_jobs j USING (ingestion_id)
+                WHERE u.ingestion_id='{ingestion_id}'
+            """,
+        )
+        self._require(bronze_before == bronze_after, "OCR recovery changed the Bronze pair")
+        self._require(
+            terminal == [{
+                "state": "OCR_FAILED", "status": "FAILED", "attempt_count": 2,
+                "job_count": 1, "draft_count": 0, "retry_audits": 1,
+            }],
+            "Live OCR recovery did not preserve one job and a defined terminal state",
+        )
+        self.evidence["ocr_failed_recovery"] = terminal[0]
+        self.evidence["checks"].append("live_ocr_failed_recovery")
 
     def lifecycle(self) -> None:
         self._install_cleanup_handlers()
@@ -714,22 +908,25 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             "Explicit bootstrap adoption failed",
         )
         adoption_before = self._adoption_rows("adoption_before_transition_apply")
-        apply_result = self._run_migration("apply_transition_migration", "apply")
+        apply_result = self._run_migration("apply_complete_transition_chain", "apply")
         self._require(
             apply_result.returncode == 0
-            and "discovered=2" in apply_result.stdout
+            and "discovered=9" in apply_result.stdout
             and "already_applied=1" in apply_result.stdout
-            and "applied_now=1" in apply_result.stdout,
-            "Version-3 transition migration did not apply exactly once",
+            and "applied_now=8" in apply_result.stdout,
+            "Complete migration chain through version 9 did not apply exactly once",
         )
         ledger = self._ledger_rows("transition_ledger")
         self._require(
-            len(ledger) == 2
+            len(ledger) == 9
             and ledger[0]["version"] == 1
             and ledger[0]["sha256"] == accepted.EXPECTED_BASELINE_SHA256
-            and ledger[1]["version"] == 3
-            and ledger[1]["name"] == "enforce_upload_state_transitions"
-            and ledger[1]["sha256"] == self.transition_sha256,
+            and ledger[2]["version"] == 3
+            and ledger[2]["name"] == "enforce_upload_state_transitions"
+            and ledger[2]["sha256"] == self.transition_sha256
+            and ledger[8]["version"] == 9
+            and ledger[8]["name"] == "add_operator_ocr_retry_transition"
+            and ledger[8]["sha256"] == self.recovery_sha256,
             "Transition migration ledger evidence is incorrect",
         )
         self._require(
@@ -764,11 +961,12 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
         self._assert_installed_contract()
         self._assert_initial_and_exhaustive_direct_sql()
         self._assert_concurrency_and_retry()
+        self._assert_ocr_failed_recovery()
         reapply = self._run_migration("idempotent_transition_reapply", "apply")
         self._require(
             reapply.returncode == 0
-            and "discovered=2" in reapply.stdout
-            and "already_applied=2" in reapply.stdout
+            and "discovered=9" in reapply.stdout
+            and "already_applied=9" in reapply.stdout
             and "applied_now=0" in reapply.stdout,
             "Transition migration reapplication was not idempotent",
         )
@@ -777,21 +975,23 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
 
 def focused_checks() -> dict[str, bool]:
     migration = TRANSITION_MIGRATION.read_text(encoding="utf-8")
+    recovery = RECOVERY_MIGRATION.read_text(encoding="utf-8")
     return {
         "accepted_helper_authenticated": sha256_path(ACCEPTED_HARNESS)
         == ACCEPTED_HARNESS_SHA256,
         "explicit_flag_is_required": "--confirm-disposable-synthetic-transition-run"
         in Path(__file__).read_text(encoding="utf-8"),
-        "exact_ten_edges_declared": len(LEGAL_TRANSITIONS) == 10,
+        "exact_eleven_edges_declared": len(LEGAL_TRANSITIONS) == 11,
         "terminal_states_have_no_edges": not {
             "REJECTED",
-            "OCR_FAILED",
             "REVIEW_REJECTED",
         }
         & {edge[0] for edge in LEGAL_TRANSITIONS},
         "direct_sql_guard_present": "OLD.state" in migration
         and "NEW.state" in migration,
         "initial_state_guard_present": "uploads_legal_initial_state" in migration,
+        "operator_retry_edge_present": "operator_retry_failed_ocr" in recovery
+        and "SILVER_DRAFT_READY" not in recovery,
         "concurrency_check_present": "ThreadPoolExecutor" in Path(__file__).read_text(
             encoding="utf-8"
         ),

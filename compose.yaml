@@ -140,6 +140,7 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_INGESTION_URL:?DATABASE_INGESTION_URL must be explicitly configured}
+      OCR_DATABASE_URL: ${DATABASE_OCR_URL:?DATABASE_OCR_URL must be explicitly configured}
       REVIEW_DATABASE_URL: ${DATABASE_REVIEW_URL:?DATABASE_REVIEW_URL must be explicitly configured}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
       MINIO_SECURE: ${MINIO_SECURE:-false}
@@ -155,6 +156,7 @@ services:
       ALLOW_PHASE_1_SOLO_SELF_REVIEW: ${ALLOW_PHASE_1_SOLO_SELF_REVIEW:-true}
       WEB_ORIGIN: ${WEB_ORIGIN:-http://127.0.0.1:8080}
       MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
+      OCR_MAX_ATTEMPTS: ${OCR_MAX_ATTEMPTS:-3}
     ports:
       - "127.0.0.1:${HOST_API_PORT:-8000}:8000"
     healthcheck:

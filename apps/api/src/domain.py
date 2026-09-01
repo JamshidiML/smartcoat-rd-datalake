@@ -82,6 +82,10 @@ class Repository(Protocol):
         self, ingestion_id: str, correlation_id: str | None = None
     ) -> str: ...
 
+    def retry_failed_ocr(
+        self, ingestion_id: str, actor_id: str, max_attempts: int
+    ) -> dict[str, Any]: ...
+
     def get_upload(self, ingestion_id: str) -> dict[str, Any]: ...
 
     def start_ocr_run(self, ingestion_id: str, run: dict[str, Any]) -> None: ...
@@ -718,6 +722,40 @@ class OCRDomainService:
             object_key=artifact_key,
         )
         return draft
+
+
+class OCRRecoveryService:
+    """Explicit, bounded recovery for the existing failed OCR job."""
+
+    def __init__(self, repository: Repository, max_attempts: int = 3) -> None:
+        if max_attempts <= 0:
+            raise ValueError("OCR retry maximum must be positive")
+        self.repository = repository
+        self.max_attempts = max_attempts
+
+    def retry(self, ingestion_id: str, actor: Actor) -> dict[str, Any]:
+        result = self.repository.retry_failed_ocr(
+            ingestion_id, actor.user_id, self.max_attempts
+        )
+        log_event(
+            "INFO",
+            "ocr.job.queued",
+            ingestion_id=ingestion_id,
+            ocr_job_id=result["ocr_job_id"],
+            actor_id=actor.user_id,
+            attempt_count=result["attempt_count"],
+            max_attempts=self.max_attempts,
+            recovery=True,
+        )
+        log_event(
+            "INFO",
+            "state.transition",
+            ingestion_id=ingestion_id,
+            actor_id=actor.user_id,
+            state_from="OCR_FAILED",
+            state_to="OCR_QUEUED",
+        )
+        return result
 
 
 class ReviewService:
