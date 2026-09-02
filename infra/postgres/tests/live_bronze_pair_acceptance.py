@@ -37,7 +37,7 @@ MINIO_IMAGE = "minio/minio:RELEASE.2025-07-23T15-54-02Z"
 MC_IMAGE = "minio/mc:RELEASE.2025-07-21T05-28-08Z"
 LEGAL_HOLD_IMAGE = "smartcoat-rd-datalake-legal-hold-applier:latest"
 MIGRATIONS = ROOT / "infra/postgres/migrations"
-EXPECTED_MIGRATIONS = tuple(range(1, 9))
+EXPECTED_MIGRATIONS = tuple(range(1, 11))
 
 
 class AcceptanceFailure(RuntimeError):
@@ -106,6 +106,14 @@ def docker(
         timeout=timeout,
         secrets_to_hide=secrets_to_hide,
     )
+
+
+def parse_final_json(stdout: str) -> Any:
+    """Parse the program result after any preceding structured log records."""
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        raise AcceptanceFailure("owned program emitted no JSON result")
+    return json.loads(lines[-1])
 
 
 def image_id(reference: str) -> str:
@@ -641,7 +649,7 @@ class Scenario:
         adopted = self.migrate("adopt", self.database)
         if not adopted.get("adopted"):
             raise AcceptanceFailure("fresh synthetic bootstrap was not explicitly adopted")
-        before_0008 = tuple(range(2, 8)) if upgraded else tuple(range(2, 9))
+        before_0008 = tuple(range(2, 8)) if upgraded else tuple(range(2, 11))
         migration_hashes = self.copy_migrations(before_0008)
         applied = self.migrate("apply")
         if upgraded:
@@ -657,7 +665,7 @@ class Scenario:
                 "'Synthetic upgraded-volume compatibility fixture.',42,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
                 "'WEB_UPLOAD','RECEIVED');",
             )
-            migration_hashes.update(self.copy_migrations((8,)))
+            migration_hashes.update(self.copy_migrations((8, 9, 10)))
             applied_0008 = self.migrate("apply")
             preserved = psql(
                 self.pg_container, self.admin, self.database,
@@ -668,7 +676,7 @@ class Scenario:
                 raise AcceptanceFailure("0008 changed the upgraded compatibility row")
             self.evidence["upgraded"] = {
                 "pre_0008_apply": applied,
-                "migration_0008_apply": applied_0008,
+                "migration_0008_through_0010_apply": applied_0008,
                 "legacy_row_preserved": True,
             }
         self.provision_roles()
@@ -791,13 +799,15 @@ class Scenario:
             "MINIO_SECRET_KEY": self.app["MINIO_APP_SECRET_KEY"],
             "TARGETS": json.dumps(self.deterministic_targets(), separators=(",", ":")),
         }
-        return json.loads(
+        return parse_final_json(
             self.run_api_python(APP_DISCOVERY_PROGRAM, environment).stdout
         )
 
     def storage_readback(self, targets: list[dict[str, str]]) -> list[dict[str, Any]]:
         environment = {**self.root, "TARGETS": json.dumps(targets, separators=(",", ":"))}
-        return json.loads(self.run_api_python(READBACK_PROGRAM, environment).stdout)
+        return parse_final_json(
+            self.run_api_python(READBACK_PROGRAM, environment).stdout
+        )
 
     def verify_ocr_exact_version_source(self, targets: list[dict[str, str]]) -> None:
         originals = [item for item in targets if item["kind"] == "ORIGINAL"]
@@ -811,7 +821,7 @@ class Scenario:
             "EXPECTED_VERSION_ID": original["version_id"],
             "EXPECTED_SHA256": original["sha256"],
         }
-        evidence = json.loads(
+        evidence = parse_final_json(
             self.run_ocr_python(OCR_EXACT_VERSION_PROGRAM, environment).stdout
         )
         if not (
@@ -855,7 +865,7 @@ class Scenario:
         upgraded = self.name == "upgraded_success"
         self.construct(upgraded)
         if self.name in {"fresh_success", "upgraded_success"}:
-            result = json.loads(
+            result = parse_final_json(
                 self.run_api_python(
                     INGEST_PROGRAM, self.ingestion_environment("success")
                 ).stdout
@@ -863,7 +873,7 @@ class Scenario:
             self.verify_success(result)
             return
         if self.name == "manifest_failure":
-            result = json.loads(
+            result = parse_final_json(
                 self.run_api_python(
                     INGEST_PROGRAM,
                     self.ingestion_environment("manifest_upload_failure"),
@@ -897,7 +907,7 @@ class Scenario:
                 "CREATE TRIGGER synthetic_bronze_pair_failure BEFORE INSERT ON bronze_pairs "
                 "FOR EACH ROW EXECUTE FUNCTION synthetic_bronze_fault.reject_pair();",
             )
-            result = json.loads(
+            result = parse_final_json(
                 self.run_api_python(
                     INGEST_PROGRAM,
                     self.ingestion_environment(
@@ -948,7 +958,7 @@ class Scenario:
                 **self.ingestion_environment("reconcile"),
                 "INGESTION_ID": ingestion_id,
             }
-            reconciliation = json.loads(
+            reconciliation = parse_final_json(
                 self.run_api_python(RECONCILE_PROGRAM, environment).stdout
             )
             final_state = self.query_state()
@@ -1006,7 +1016,7 @@ def discover_migrations() -> tuple[int, ...]:
         for path in sorted(MIGRATIONS.glob("[0-9][0-9][0-9][0-9]__*.sql"))
     )
     if values != EXPECTED_MIGRATIONS:
-        raise AcceptanceFailure("migration sequence is not exactly 0001 through 0008")
+        raise AcceptanceFailure("migration sequence is not exactly 0001 through 0010")
     return values
 
 

@@ -27,6 +27,7 @@ from rbac_contract import (
     RUNTIME_ROLES,
     TABLE_PRIVILEGES,
     expected_role_attributes,
+    missing_positive_path_requirements,
     password_values,
 )
 
@@ -161,7 +162,7 @@ def validate_installed_contract(connection: Any) -> None:
     column_rows = connection.execute(
         """
         SELECT grantee, table_name, column_name
-        FROM information_schema.column_privileges
+        FROM information_schema.column_privileges AS column_grant
         WHERE table_schema = 'public'
           AND privilege_type = 'UPDATE'
           AND grantee = ANY(%s)
@@ -175,17 +176,30 @@ def validate_installed_contract(connection: Any) -> None:
     select_column_rows = connection.execute(
         """
         SELECT grantee, table_name, column_name
-        FROM information_schema.column_privileges
+        FROM information_schema.column_privileges AS column_grant
         WHERE table_schema = 'public'
-          AND table_name = 'audit_events'
           AND privilege_type = 'SELECT'
-          AND grantee = 'smartcoat_review'
+          AND grantee = ANY(%s)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM information_schema.table_privileges AS table_grant
+              WHERE table_grant.table_schema = column_grant.table_schema
+                AND table_grant.table_name = column_grant.table_name
+                AND table_grant.grantee = column_grant.grantee
+                AND table_grant.privilege_type = 'SELECT'
+          )
         ORDER BY grantee, table_name, column_name
-        """
+        """,
+        (list(ROLE_NAMES),),
     ).fetchall()
     if frozenset(tuple(row) for row in select_column_rows) != COLUMN_SELECT_PRIVILEGES:
         raise ProvisioningError(
-            "Column-select grants do not match the review retry-evidence contract"
+            "Column-select grants do not match the positive-path contract"
+        )
+
+    if missing_positive_path_requirements():
+        raise ProvisioningError(
+            "Runtime grants do not satisfy every required positive path"
         )
 
     metadata_rows = connection.execute(

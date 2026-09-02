@@ -51,6 +51,132 @@ RUNTIME_ROLES = {
     "smartcoat_backup": "POSTGRES_BACKUP_PASSWORD",
 }
 
+APPLICATION_POSITIVE_PROGRAM = r'''
+import json
+import os
+import sys
+from datetime import UTC, datetime
+
+sys.path.insert(0, "/workspace")
+from database import PostgresRepository
+from domain import Actor, IngestionService, OCRDomainService, ReviewService
+from retention_enforcement import RetentionEnforcementEvidence
+from retention_policy import plan_assignment
+
+identifiers = json.loads(os.environ["POSITIVE_PATH_IDENTIFIERS"])
+ingestion_repository = PostgresRepository(os.environ["DATABASE_INGESTION_URL"])
+ocr = OCRDomainService(PostgresRepository(os.environ["DATABASE_OCR_URL"]))
+review = ReviewService(PostgresRepository(os.environ["DATABASE_REVIEW_URL"]), False)
+uploader = Actor(identifiers["uploader"], "Synthetic Uploader")
+reviewer = Actor(identifiers["reviewer"], "Synthetic Reviewer")
+
+class SyntheticStorage:
+    def __init__(self):
+        self.objects = {}
+
+    def put_once(self, bucket, key, data, content_type, locked):
+        del content_type, locked
+        self.objects[(bucket, key)] = bytes(data)
+        return {"version_id": f"synthetic-{bucket}-{key.rsplit('/', 1)[-1]}"}
+
+    def get_exact(self, bucket, key, version_id):
+        del version_id
+        return self.objects[(bucket, key)]
+
+    def list_exact_versions(self, bucket, key):
+        del bucket, key
+        return []
+
+class SyntheticRetention:
+    def enforce(
+        self, *, target, retention_assignment_id, data_category,
+        retention_class, retention_policy_version, enforced_by
+    ):
+        accepted = datetime.now(UTC).replace(microsecond=0)
+        plan = plan_assignment(data_category, accepted)
+        if (
+            plan.retention_class != retention_class
+            or plan.retention_policy_version != retention_policy_version
+        ):
+            raise RuntimeError("synthetic retention plan mismatch")
+        return RetentionEnforcementEvidence(
+            retention_assignment_id=retention_assignment_id,
+            bucket_name=target.bucket_name,
+            object_key=target.object_key,
+            object_kind=target.object_kind,
+            object_version_id=target.object_version_id,
+            data_category=plan.data_category,
+            retention_class=plan.retention_class,
+            retention_policy_version=plan.retention_policy_version,
+            accepted_storage_at_utc=accepted,
+            requested_retention_mode="COMPLIANCE",
+            requested_retain_until_utc=plan.expected_retain_until_utc,
+            requested_legal_hold_status="ON",
+            observed_object_version_id=target.object_version_id,
+            observed_retention_mode="COMPLIANCE",
+            observed_retain_until_utc=plan.expected_retain_until_utc,
+            observed_legal_hold_status="ON",
+            enforcement_verified_at_utc=accepted,
+            enforcement_verification_result="SUCCESS",
+            failure_code=None,
+            enforced_by=enforced_by,
+            details_json={"fixture": "m0-r02-positive-path"},
+        )
+
+ingestion_repository.ensure_local_user(
+    uploader.user_id, uploader.display_name, "synthetic-uploader@example.invalid"
+)
+ingestion_repository.ensure_local_user(
+    reviewer.user_id, reviewer.display_name, "synthetic-reviewer@example.invalid"
+)
+ingestion = IngestionService(
+    ingestion_repository, SyntheticStorage(), 1024 * 1024, SyntheticRetention()
+)
+outcomes = {}
+for outcome in ("approve", "reject"):
+    upload = ingestion.ingest(
+        uploader,
+        f"positive-{outcome}.jpg",
+        b"\xff\xd8\xff\xe0" + outcome.encode() + b"\xff\xd9",
+        "LAB_NOTE",
+        f"Synthetic real {outcome} positive path.",
+        None,
+    )
+    ingestion_id = upload["ingestion_id"]
+    run_id = ocr.start(
+        ingestion_id, "paddleocr", "synthetic-1.0", {"fixture": outcome}
+    )
+    draft = ocr.complete(
+        ingestion_id,
+        run_id,
+        f"Synthetic {outcome} text",
+        [],
+        json.dumps({"fixture": outcome}).encode(),
+        f"rd/synthetic/{run_id}.json",
+    )
+    if outcome == "approve":
+        result = review.review(
+            draft["silver_draft_id"], reviewer, "Synthetic approved text",
+            "APPROVED_WITH_CORRECTIONS", "Synthetic correction", True,
+        )
+        if result is None or result["status"] != "VERIFIED":
+            raise RuntimeError("REAL_APPROVAL_DID_NOT_VERIFY")
+        outcomes[outcome] = {
+            "ingestion_id": ingestion_id, "status": result["status"]
+        }
+    else:
+        result = review.review(
+            draft["silver_draft_id"], reviewer, "",
+            "REJECTED_UNREADABLE", "Synthetic unreadable fixture", True,
+        )
+        if result is not None:
+            raise RuntimeError("REAL_REJECTION_CREATED_VERIFIED_RECORD")
+        outcomes[outcome] = {
+            "ingestion_id": ingestion_id, "status": "REVIEW_REJECTED"
+        }
+print(json.dumps(outcomes, sort_keys=True))
+'''
+
 sys.path.insert(0, str(POSTGRES_ROOT))
 import rbac_contract  # noqa: E402
 
@@ -150,12 +276,13 @@ class Scenario:
         self.finalized = False
         self.commands: list[dict[str, Any]] = []
         self.checks: list[str] = []
-        self.ids = {name: str(uuid.uuid4()) for name in (
-            "upload", "bronze_original", "bronze_manifest", "job", "run",
-            "draft", "decision", "verified", "audit_ingestion", "audit_ocr",
-            "audit_review", "request_ingestion", "request_ocr", "request_review",
-            "upgrade_upload",
-        )}
+        self.ids = {
+            name: str(uuid.uuid4())
+            for name in (
+                "upgrade_upload", "approve_upload", "reject_upload",
+                "bronze_original",
+            )
+        }
         self.passwords = {
             "POSTGRES_PASSWORD": secrets.token_hex(24),
             "POSTGRES_APP_PASSWORD": secrets.token_hex(24),
@@ -219,29 +346,22 @@ class Scenario:
             require(path.is_file(), f"Required implementation path is missing: {path.name}", EnvironmentError)
         discovered = sorted(MIGRATIONS_ROOT.glob("*.sql"))
         require(
-            [path.name for path in discovered] == [
-                "0001__validate_bootstrap_prerequisites.sql",
-                "0002__separate_runtime_roles.sql",
-                "0003__enforce_upload_state_transitions.sql",
-                "0004__enforce_atomic_review_decisions.sql",
-                "0005__expand_retention_metadata.sql",
-                "0006__grant_review_audit_evidence_read.sql",
-            ],
-            "Compatibility acceptance requires the exact integrated version-1-through-version-6 migration plan",
+            [path.name[:4] for path in discovered]
+            == [f"{version:04d}" for version in range(1, 11)],
+            "RBAC acceptance requires the exact integrated version-1-through-version-10 migration plan",
         )
         focused_names = {
             "0001__validate_bootstrap_prerequisites.sql",
             "0002__separate_runtime_roles.sql",
             "0006__grant_review_audit_evidence_read.sql",
+            "0010__grant_positive_path_bronze_reads.sql",
         }
-        focused_migrations = [
-            path for path in discovered if path.name in focused_names
-        ]
+        focused_migrations = [path for path in discovered if path.name in focused_names]
         self.baseline_directory.mkdir(mode=0o755)
         self.full_directory.mkdir(mode=0o755)
         for destination, sources in (
             (self.baseline_directory, focused_migrations[:1]),
-            (self.full_directory, focused_migrations),
+            (self.full_directory, discovered),
         ):
             for source in sources:
                 target = destination / source.name
@@ -416,8 +536,8 @@ class Scenario:
             self.checks.append("upgraded_volume_started_from_accepted_version_1")
         applied = self._migration("ordinary_apply", self.full_directory, "apply")
         require(
-            applied.returncode == 0 and "already_applied=1 applied_now=2" in applied.stdout,
-            "Migrations 0002 and 0006 were not each applied exactly once",
+            applied.returncode == 0 and "already_applied=1 applied_now=9" in applied.stdout,
+            "Integrated migrations 0002 through 0010 were not applied exactly once",
         )
         if self.mode == "upgraded":
             require(
@@ -449,17 +569,44 @@ class Scenario:
             self.checks.extend(["upgraded_rows_preserved_exactly", "legacy_credential_rejected"])
         repeated = self._migration("idempotent_apply", self.full_directory, "apply")
         require(
-            repeated.returncode == 0 and "already_applied=3 applied_now=0" in repeated.stdout,
+            repeated.returncode == 0 and "already_applied=10 applied_now=0" in repeated.stdout,
             "Migration reapplication was not idempotent",
         )
         self.checks.extend([
             "explicit_adoption",
-            "migration_0002_applied_once",
-            "migration_0006_applied_once",
+            "integrated_migrations_0002_through_0010_applied_once",
             "migration_reapply_idempotent",
         ])
 
     def provision(self) -> None:
+        explicit_column_probe = self._psql(
+            "explicit_column_grant_catalog_probe",
+            self.admin,
+            self.passwords["POSTGRES_PASSWORD"],
+            """
+            SELECT grantee, table_name, column_name
+            FROM information_schema.column_privileges AS column_grant
+            WHERE table_schema = 'public'
+              AND privilege_type = 'SELECT'
+              AND grantee IN (
+                'smartcoat_ingestion','smartcoat_ocr',
+                'smartcoat_review','smartcoat_backup'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM information_schema.table_privileges AS table_grant
+                  WHERE table_grant.table_schema = column_grant.table_schema
+                    AND table_grant.table_name = column_grant.table_name
+                    AND table_grant.grantee = column_grant.grantee
+                    AND table_grant.privilege_type = 'SELECT'
+              )
+            ORDER BY grantee, table_name, column_name
+            """,
+        )
+        require(
+            explicit_column_probe.returncode == 0,
+            "Explicit column-grant catalog query failed",
+        )
         admin_url = (
             f"postgresql://{self.admin}:{self.passwords['POSTGRES_PASSWORD']}"
             f"@postgres:5432/{self.database}"
@@ -467,6 +614,54 @@ class Scenario:
         self.secret_values.add(admin_url)
         environment = {"POSTGRES_ROLE_ADMIN_URL": admin_url}
         environment.update({name: self.passwords[name] for name in RUNTIME_ROLES.values()})
+        validation_program = r'''
+import json, os, sys
+sys.path.insert(0, "/opt/smartcoat-postgres")
+import psycopg
+import provision_runtime_roles
+last = {"query": "not-started", "parameters": []}
+class TracedConnection:
+    def __init__(self, connection):
+        self.connection = connection
+    def execute(self, query, parameters=None):
+        last["query"] = " ".join(str(query).split())[:160]
+        last["parameters"] = list(parameters or ())
+        return self.connection.execute(query, parameters)
+try:
+    with psycopg.connect(os.environ["POSTGRES_ROLE_ADMIN_URL"]) as connection:
+        provision_runtime_roles.validate_installed_contract(
+            TracedConnection(connection)
+        )
+except Exception as exc:
+    print(json.dumps({
+        "exception_type": type(exc).__name__,
+        "sqlstate": getattr(exc, "sqlstate", None),
+        "message": str(exc) if isinstance(
+            exc, provision_runtime_roles.ProvisioningError
+        ) else "non-contract exception",
+        "last_operation": last,
+    }, sort_keys=True))
+    raise SystemExit(1)
+print(json.dumps({"validated": True}, sort_keys=True))
+'''
+        validation_arguments = [
+            "docker", "run", "--rm", "--pull", "never",
+            "--network", self.network,
+            "--label", f"{OWNERSHIP_LABEL}={self.project}",
+            "--env", "POSTGRES_ROLE_ADMIN_URL",
+            "--volume", f"{POSTGRES_ROOT.resolve()}:/opt/smartcoat-postgres:ro",
+            "--entrypoint", "python", self.migration_image_id,
+            "-c", validation_program,
+        ]
+        validation = self._run(
+            "validate_installed_contract_before_provisioning",
+            validation_arguments,
+            environment={"POSTGRES_ROLE_ADMIN_URL": admin_url},
+        )
+        require(
+            validation.returncode == 0,
+            f"Installed contract validation failed: {validation.stdout.strip()[:300]}",
+        )
         arguments = [
             "docker", "run", "--rm", "--pull", "never",
             "--network", self.network,
@@ -477,10 +672,16 @@ class Scenario:
             arguments.extend(["--env", name])
         arguments.extend([self.migration_image_id, "/opt/smartcoat-postgres/provision_runtime_roles.py"])
         completed = self._run("provision_runtime_credentials", arguments, environment=environment, timeout=180)
+        diagnostic = "sanitized diagnostic unavailable"
+        for line in completed.stderr.splitlines():
+            if line.startswith("Runtime-role provisioning error: "):
+                diagnostic = line.removeprefix(
+                    "Runtime-role provisioning error: "
+                )[:240]
         require(
             completed.returncode == 0
             and "roles=4 credentials_updated=4" in completed.stdout,
-            "Runtime credential provisioner failed",
+            f"Runtime credential provisioner failed: {diagnostic}",
         )
         self.checks.append("credential_provisioning_boundary_passed")
 
@@ -602,7 +803,7 @@ class Scenario:
                 SELECT COALESCE(json_agg(row_to_json(p) ORDER BY grantee,table_name,column_name),'[]')::text
                 FROM (
                     SELECT grantee,table_name,column_name
-                    FROM information_schema.column_privileges
+                    FROM information_schema.column_privileges column_grant
                     WHERE table_schema='public' AND privilege_type='UPDATE'
                       AND grantee IN ('smartcoat_ingestion','smartcoat_ocr','smartcoat_review','smartcoat_backup')
                 ) p
@@ -617,16 +818,23 @@ class Scenario:
             "Catalog column grants differ from the exact M0-R02 matrix",
         )
         select_column_privileges = self._json_value(
-            "catalog_review_audit_column_privileges",
+            "catalog_positive_select_column_privileges",
             self._admin_value(
-                "catalog_review_audit_column_privileges",
+                "catalog_positive_select_column_privileges",
                 """
                 SELECT COALESCE(json_agg(row_to_json(p) ORDER BY grantee,table_name,column_name),'[]')::text
                 FROM (
                     SELECT grantee,table_name,column_name
-                    FROM information_schema.column_privileges
-                    WHERE table_schema='public' AND table_name='audit_events'
-                      AND privilege_type='SELECT' AND grantee='smartcoat_review'
+                    FROM information_schema.column_privileges column_grant
+                    WHERE table_schema='public' AND privilege_type='SELECT'
+                      AND grantee IN ('smartcoat_ingestion','smartcoat_ocr','smartcoat_review','smartcoat_backup')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.table_privileges table_grant
+                        WHERE table_grant.table_schema=column_grant.table_schema
+                          AND table_grant.table_name=column_grant.table_name
+                          AND table_grant.grantee=column_grant.grantee
+                          AND table_grant.privilege_type='SELECT'
+                      )
                 ) p
                 """,
             ),
@@ -636,7 +844,7 @@ class Scenario:
                 (row["grantee"], row["table_name"], row["column_name"])
                 for row in select_column_privileges
             } == rbac_contract.COLUMN_SELECT_PRIVILEGES,
-            "Catalog review audit column grants differ from the compatibility contract",
+            "Catalog column-select grants differ from the positive-path contract",
         )
         require(
             self._admin_value(
@@ -656,7 +864,7 @@ class Scenario:
             self._admin_value(
                 "catalog_ledger",
                 "SELECT json_agg(version ORDER BY version)::text FROM smartcoat_migrations.applied_migrations",
-            ) == "[1, 2, 6]",
+            ) == "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]",
             "Migration ledger is not the exact accepted prefix",
         )
         require(
@@ -684,94 +892,129 @@ class Scenario:
         )
         self.checks.extend([
             "exact_role_attributes", "no_role_memberships", "exact_table_grant_matrix",
-            "exact_column_grant_matrix", "exact_review_audit_column_grant_matrix",
+            "exact_column_grant_matrix", "exact_positive_select_column_grant_matrix",
             "legacy_login_disabled",
             "exact_ledger_prefix", "application_append_only_triggers_preserved",
             "migration_metadata_guards_preserved",
         ])
 
+    def application_positive_paths(self) -> None:
+        token = self.project.split("-")[1]
+        urls = {
+            "DATABASE_INGESTION_URL": (
+                "postgresql://smartcoat_ingestion:"
+                f"{self.passwords['POSTGRES_INGESTION_PASSWORD']}@postgres:5432/{self.database}"
+            ),
+            "DATABASE_OCR_URL": (
+                "postgresql://smartcoat_ocr:"
+                f"{self.passwords['POSTGRES_OCR_PASSWORD']}@postgres:5432/{self.database}"
+            ),
+            "DATABASE_REVIEW_URL": (
+                "postgresql://smartcoat_review:"
+                f"{self.passwords['POSTGRES_REVIEW_PASSWORD']}@postgres:5432/{self.database}"
+            ),
+        }
+        identifiers = {
+            "uploader": f"usr_rbac_{token}",
+            "reviewer": f"usr_review_{token}",
+        }
+        environment = {
+            **urls,
+            "POSITIVE_PATH_IDENTIFIERS": json.dumps(
+                identifiers, sort_keys=True, separators=(",", ":")
+            ),
+        }
+        self.secret_values.update(urls.values())
+        arguments = [
+            "docker", "run", "--rm", "--pull", "never",
+            "--network", self.network,
+            "--label", f"{OWNERSHIP_LABEL}={self.project}",
+        ]
+        for name in environment:
+            arguments.extend(["--env", name])
+        arguments.extend([
+            "--volume", f"{(ROOT / 'apps/api/src').resolve()}:/workspace:ro",
+            "--entrypoint", "python", self.migration_image_id,
+            "-c", APPLICATION_POSITIVE_PROGRAM,
+        ])
+        completed = self._run(
+            "real_application_positive_paths",
+            arguments,
+            environment=environment,
+            timeout=180,
+        )
+        diagnostic_lines = [
+            line.strip()
+            for line in (completed.stderr or completed.stdout).splitlines()
+            if line.strip()
+        ]
+        diagnostic = diagnostic_lines[-1][:300] if diagnostic_lines else "no output"
+        require(
+            completed.returncode == 0,
+            "Real application positive paths failed under separated credentials: "
+            f"{diagnostic}",
+        )
+        try:
+            outcomes = json.loads(completed.stdout.splitlines()[-1])
+        except json.JSONDecodeError as exc:
+            raise AcceptanceError(
+                "Real application positive-path evidence was not valid JSON"
+            ) from exc
+        require(
+            isinstance(outcomes, dict)
+            and outcomes.get("approve", {}).get("status") == "VERIFIED"
+            and outcomes.get("reject", {}).get("status") == "REVIEW_REJECTED",
+            "Real approval and rejection outcomes were not exact",
+        )
+        self.ids["approve_upload"] = str(outcomes["approve"]["ingestion_id"])
+        self.ids["reject_upload"] = str(outcomes["reject"]["ingestion_id"])
+        self.ids["bronze_original"] = self._admin_value(
+            "real_application_bronze_object_identity",
+            f"""
+            SELECT bronze_object_id::text FROM bronze_objects
+            WHERE ingestion_id='{self.ids['approve_upload']}'
+              AND object_kind='ORIGINAL'
+            """,
+        )
+        state = self._json_value(
+            "real_application_positive_path_state",
+            self._admin_value(
+                "real_application_positive_path_state",
+                f"""
+                SELECT json_build_object(
+                  'approve_state',(SELECT state FROM uploads WHERE ingestion_id='{self.ids['approve_upload']}'),
+                  'reject_state',(SELECT state FROM uploads WHERE ingestion_id='{self.ids['reject_upload']}'),
+                  'completed_ocr_runs',(SELECT count(*) FROM ocr_runs WHERE ingestion_id IN
+                    ('{self.ids['approve_upload']}','{self.ids['reject_upload']}') AND status='COMPLETED'),
+                  'reviewed_drafts',(SELECT count(*) FROM silver_drafts WHERE ingestion_id IN
+                    ('{self.ids['approve_upload']}','{self.ids['reject_upload']}') AND status='REVIEWED'),
+                  'decisions',(SELECT count(*) FROM review_decisions WHERE ingestion_id IN
+                    ('{self.ids['approve_upload']}','{self.ids['reject_upload']}')),
+                  'verified',(SELECT count(*) FROM silver_verified_records WHERE ingestion_id IN
+                    ('{self.ids['approve_upload']}','{self.ids['reject_upload']}'))
+                )::text
+                """,
+            ),
+        )
+        require(
+            state == {
+                "approve_state": "VERIFIED",
+                "reject_state": "REVIEW_REJECTED",
+                "completed_ocr_runs": 2,
+                "reviewed_drafts": 2,
+                "decisions": 2,
+                "verified": 1,
+            },
+            "Real application positive-path database evidence was incomplete",
+        )
+        self.checks.extend([
+            "real_ocr_domain_path_under_ocr_credential",
+            "real_review_approve_under_review_credential",
+            "real_review_reject_under_review_credential",
+        ])
+
     def positive_sql(self) -> None:
-        i = self.ids
-        digest = "a" * 64
-        self._role_sql(
-            "positive_ingestion_workflow",
-            "smartcoat_ingestion",
-            f"""
-            BEGIN;
-            INSERT INTO users(user_id,display_name,email,role,active,created_at_utc)
-            VALUES ('usr_rbac_{self.project.split('-')[1]}','Synthetic Uploader','synthetic-{self.project}@invalid.example','UPLOADER',true,now());
-            INSERT INTO users(user_id,display_name,email,role,active,created_at_utc)
-            VALUES ('usr_review_{self.project.split('-')[1]}','Synthetic Reviewer','review-{self.project}@invalid.example','REVIEWER',true,now());
-            INSERT INTO uploads(ingestion_id,department,uploader_user_id,uploader_display_name,uploaded_at_utc,
-              original_filename,stored_object_key,manifest_object_key,detected_mime_type,declared_file_type,
-              document_category,context_note,byte_size,source_sha256,source_channel,state)
-            VALUES ('{i['upload']}','RND','usr_rbac_{self.project.split('-')[1]}','Synthetic Uploader',now(),
-              'synthetic.png','synthetic/{i['upload']}/original','synthetic/{i['upload']}/manifest',
-              'image/png','PHOTO','LAB_NOTE','Synthetic M0-R02 acceptance only',100,'{digest}','WEB_UPLOAD','OCR_QUEUED');
-            INSERT INTO bronze_objects(bronze_object_id,ingestion_id,bucket_name,object_key,object_kind,sha256,
-              object_version_id,retention_mode,retain_until_utc,created_at_utc)
-            VALUES ('{i['bronze_original']}','{i['upload']}','synthetic','original-{i['upload']}','ORIGINAL','{digest}',
-              'synthetic-version-original','COMPLIANCE',now()+interval '1 day',now()),
-              ('{i['bronze_manifest']}','{i['upload']}','synthetic','manifest-{i['upload']}','MANIFEST','{digest}',
-              'synthetic-version-manifest','COMPLIANCE',now()+interval '1 day',now());
-            INSERT INTO ocr_jobs(ocr_job_id,ingestion_id,status,queued_at_utc,attempt_count)
-            VALUES ('{i['job']}','{i['upload']}','QUEUED',now(),0);
-            INSERT INTO audit_events(event_id,occurred_at_utc,system_actor,entity_type,entity_id,event_type,
-              request_id,details_json) VALUES ('{i['audit_ingestion']}',now(),'system','UPLOAD','{i['upload']}',
-              'SYNTHETIC_INGESTION','{i['request_ingestion']}','{{}}');
-            COMMIT;
-            """,
-            allowed=True,
-        )
-        self._role_sql(
-            "positive_ocr_workflow",
-            "smartcoat_ocr",
-            f"""
-            BEGIN;
-            UPDATE ocr_jobs SET status='RUNNING',started_at_utc=now(),attempt_count=attempt_count+1
-              WHERE ocr_job_id='{i['job']}';
-            INSERT INTO ocr_runs(ocr_run_id,ocr_job_id,ingestion_id,engine,engine_version,configuration_json,
-              source_sha256,status,started_at_utc) VALUES ('{i['run']}','{i['job']}','{i['upload']}',
-              'paddleocr','synthetic','{{}}','{digest}','RUNNING',now());
-            UPDATE ocr_runs SET status='COMPLETED',raw_output_sha256='{digest}',
-              raw_artifact_key='synthetic-artifact',completed_at_utc=now() WHERE ocr_run_id='{i['run']}';
-            UPDATE ocr_jobs SET status='COMPLETED',completed_at_utc=now() WHERE ocr_job_id='{i['job']}';
-            INSERT INTO silver_drafts(silver_draft_id,ingestion_id,source_sha256,ocr_run_id,status,
-              extracted_text,text_blocks_json,source_file_type,document_category,extraction_engine,
-              extraction_engine_version,created_at_utc) VALUES ('{i['draft']}','{i['upload']}','{digest}',
-              '{i['run']}','DRAFT_UNVERIFIED','synthetic text','[]','PHOTO','LAB_NOTE','paddleocr','synthetic',now());
-            INSERT INTO audit_events(event_id,occurred_at_utc,system_actor,entity_type,entity_id,event_type,
-              request_id,details_json) VALUES ('{i['audit_ocr']}',now(),'ocr-worker','UPLOAD','{i['upload']}',
-              'SYNTHETIC_OCR','{i['request_ocr']}','{{}}');
-            UPDATE uploads SET state='SILVER_DRAFT_READY' WHERE ingestion_id='{i['upload']}';
-            COMMIT;
-            """,
-            allowed=True,
-        )
-        self._role_sql(
-            "positive_review_workflow",
-            "smartcoat_review",
-            f"""
-            BEGIN;
-            UPDATE uploads SET state='UNDER_HUMAN_REVIEW' WHERE ingestion_id='{i['upload']}';
-            INSERT INTO review_decisions(review_decision_id,silver_draft_id,ingestion_id,reviewer_user_id,
-              reviewed_at_utc,decision,explicit_confirmation,correction_summary,self_review_detected,
-              solo_exception_applied) VALUES ('{i['decision']}','{i['draft']}','{i['upload']}',
-              'usr_review_{self.project.split('-')[1]}',now(),'APPROVED_NO_CHANGES',true,'',false,false);
-            UPDATE silver_drafts SET status='REVIEWED' WHERE silver_draft_id='{i['draft']}';
-            INSERT INTO silver_verified_records(silver_record_id,silver_revision,ingestion_id,source_sha256,
-              status,verified_text,reviewer_user_id,reviewed_at_utc,review_decision,correction_summary,
-              source_object_key,ocr_artifact_key,review_decision_id) VALUES ('{i['verified']}',1,'{i['upload']}',
-              '{digest}','VERIFIED','synthetic text','usr_review_{self.project.split('-')[1]}',now(),
-              'APPROVED_NO_CHANGES','','synthetic/{i['upload']}/original','synthetic-artifact','{i['decision']}');
-            INSERT INTO audit_events(event_id,occurred_at_utc,actor_user_id,entity_type,entity_id,event_type,
-              request_id,details_json) VALUES ('{i['audit_review']}',now(),'usr_review_{self.project.split('-')[1]}',
-              'UPLOAD','{i['upload']}','SYNTHETIC_REVIEW','{i['request_review']}','{{}}');
-            UPDATE uploads SET state='VERIFIED' WHERE ingestion_id='{i['upload']}';
-            COMMIT;
-            """,
-            allowed=True,
-        )
+        self.application_positive_paths()
         self._role_sql(
             "positive_review_retry_audit_evidence_read",
             "smartcoat_review",
@@ -785,35 +1028,31 @@ class Scenario:
                 count(*) FILTER (
                     WHERE entity_type='UPLOAD'
                       AND event_type='UPLOAD_STATE_CHANGED'
-                      AND new_state='VERIFIED'
+                      AND new_state IN ('VERIFIED','REVIEW_REJECTED')
                       AND details_json->>'review_request_sha256' IS NOT NULL
                 )
             FROM audit_events
             """,
             allowed=True,
         )
+        backup_reads = "\n".join(
+            f"SELECT count(*) FROM {table};"
+            for table in rbac_contract.PUBLIC_TABLES
+        )
+        backup_reads += (
+            "\nSELECT count(*) FROM smartcoat_migrations.applied_migrations;"
+            "\nSELECT count(*) FROM smartcoat_migrations.adoption_decisions;"
+        )
         self._role_sql(
             "positive_backup_reads_all_evidence",
             "smartcoat_backup",
-            """
-            SELECT count(*) FROM users;
-            SELECT count(*) FROM uploads;
-            SELECT count(*) FROM bronze_objects;
-            SELECT count(*) FROM ocr_jobs;
-            SELECT count(*) FROM ocr_runs;
-            SELECT count(*) FROM silver_drafts;
-            SELECT count(*) FROM review_decisions;
-            SELECT count(*) FROM silver_verified_records;
-            SELECT count(*) FROM audit_events;
-            SELECT count(*) FROM smartcoat_migrations.applied_migrations;
-            SELECT count(*) FROM smartcoat_migrations.adoption_decisions;
-            """,
+            backup_reads,
             allowed=True,
         )
 
     def negative_sql(self) -> None:
         i = self.ids
-        expected_uploads = 2 if self.mode == "upgraded" else 1
+        expected_uploads = 3 if self.mode == "upgraded" else 2
         denials = (
             ("deny_ingestion_review", "smartcoat_ingestion", "INSERT INTO review_decisions DEFAULT VALUES"),
             ("deny_ingestion_verified", "smartcoat_ingestion", "INSERT INTO silver_verified_records DEFAULT VALUES"),
@@ -823,7 +1062,7 @@ class Scenario:
             ("deny_review_ungranted_audit_column", "smartcoat_review", "SELECT event_id FROM audit_events"),
             ("deny_review_audit_update", "smartcoat_review", "UPDATE audit_events SET event_type='forbidden'"),
             ("deny_review_audit_delete", "smartcoat_review", "DELETE FROM audit_events"),
-            ("deny_backup_write", "smartcoat_backup", f"UPDATE uploads SET state='REJECTED' WHERE ingestion_id='{i['upload']}'"),
+            ("deny_backup_write", "smartcoat_backup", f"UPDATE uploads SET state='REJECTED' WHERE ingestion_id='{i['approve_upload']}'"),
         )
         for label, role, sql_text in denials:
             self._role_sql(label, role, sql_text, allowed=False)
@@ -871,7 +1110,7 @@ class Scenario:
                   (SELECT count(*) FROM smartcoat_migrations.adoption_decisions)
                 )::text
                 """,
-            ) == f"[{expected_uploads}, 2, 1, 1, 1, 3, 1]",
+            ) == f"[{expected_uploads}, 4, 2, 2, 1, 10, 1]",
             "Denied SQL changed accepted synthetic state",
         )
         self.checks.extend(["append_only_direct_sql_rejected", "denials_left_state_unchanged"])
