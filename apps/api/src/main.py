@@ -15,12 +15,13 @@ from pydantic import BaseModel
 from database import PostgresRepository
 from domain import (
     Actor,
+    configured_ocr_max_attempts,
     IngestionService,
     OCRRecoveryService,
     ReviewService,
     StateConflict,
 )
-from operational_logging import (
+from packages.smartcoat_logging.operational_logging import (
     bind_correlation,
     configure_service,
     log_event,
@@ -48,7 +49,7 @@ SESSION_SECRET = os.environ["SESSION_SECRET"]
 WEB_ORIGIN = os.getenv("WEB_ORIGIN", "http://127.0.0.1:8080")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 ALLOW_SOLO_REVIEW = os.getenv("ALLOW_PHASE_1_SOLO_SELF_REVIEW", "true").lower() == "true"
-OCR_MAX_ATTEMPTS = int(os.getenv("OCR_MAX_ATTEMPTS", "3"))
+OCR_MAX_ATTEMPTS = configured_ocr_max_attempts()
 
 configure_service("api")
 

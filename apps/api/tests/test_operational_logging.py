@@ -9,7 +9,7 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SOURCE))
 
-import operational_logging  # noqa: E402
+from packages.smartcoat_logging import operational_logging  # noqa: E402
 from domain import Actor, IngestionService  # noqa: E402
 from fakes import MemoryRepository, MemoryRetentionEnforcer, MemoryStorage  # noqa: E402
 

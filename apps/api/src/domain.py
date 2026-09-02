@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from identifiers import uuid7
-from operational_logging import current_correlation_id, log_event
+from packages.smartcoat_logging.operational_logging import (
+    current_correlation_id,
+    log_event,
+)
 from retention_enforcement import ExactVersionTarget, RetentionEnforcementEvidence
 from retention_policy import (
     RETENTION_POLICY_VERSION,
@@ -27,6 +31,20 @@ REJECTION_DECISIONS = {
     "REJECTED_WRONG_DOCUMENT_TYPE",
     "REQUIRES_REUPLOAD",
 }
+DEFAULT_OCR_MAX_ATTEMPTS = 3
+
+
+def configured_ocr_max_attempts(
+    environment: dict[str, str] | None = None,
+) -> int:
+    """Return a positive retry limit, falling back safely on invalid input."""
+
+    source = os.environ if environment is None else environment
+    try:
+        configured = int(source.get("OCR_MAX_ATTEMPTS", str(DEFAULT_OCR_MAX_ATTEMPTS)))
+    except (TypeError, ValueError):
+        return DEFAULT_OCR_MAX_ATTEMPTS
+    return configured if configured > 0 else DEFAULT_OCR_MAX_ATTEMPTS
 
 
 class StateConflict(RuntimeError):

@@ -7,7 +7,7 @@ from minio import Minio
 from minio.error import S3Error
 
 from domain import StateConflict
-from operational_logging import log_event
+from packages.smartcoat_logging.operational_logging import log_event
 
 
 class MinioObjectStorage:

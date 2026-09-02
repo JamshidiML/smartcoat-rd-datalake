@@ -12,6 +12,7 @@ from typing import Any
 from minio import Minio
 
 from contract import LEGAL_HOLD_ON, RequestRejected, validate_request
+from packages.smartcoat_logging.operational_logging import configure_service, log_event
 
 
 MAX_REQUEST_BYTES = 16_384
@@ -48,6 +49,7 @@ CLIENT = Minio(
     secure=secure_transport(),
 )
 CALL_TOKEN = required_call_token()
+configure_service("legal-hold-applier")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -56,7 +58,36 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         del format, args
 
-    def respond(self, status: HTTPStatus, body: dict[str, Any]) -> None:
+    def respond(
+        self,
+        status: HTTPStatus,
+        body: dict[str, Any],
+        *,
+        target: Any | None = None,
+    ) -> None:
+        classification = str(
+            body.get("classification")
+            or ("HEALTHY" if body.get("status") == "ok" else "REQUEST_COMPLETED")
+        )
+        outcome = (
+            "SUCCESS"
+            if status.value < 400
+            else "FAILED"
+            if status.value >= 500
+            else "REJECTED"
+        )
+        log_event(
+            "INFO" if outcome == "SUCCESS" else "WARNING",
+            "legal_hold.request",
+            classification=classification,
+            bucket=body.get("bucket") or getattr(target, "bucket", None),
+            object_key=body.get("object_key") or getattr(target, "object_key", None),
+            version_id=body.get("version_id") or getattr(target, "version_id", None),
+            outcome=outcome,
+            method=self.command,
+            path=self.path,
+            status_code=status.value,
+        )
         encoded = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -103,12 +134,14 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(
                 HTTPStatus.BAD_GATEWAY,
                 {"classification": "LEGAL_HOLD_APPLY_FAILED"},
+                target=target,
             )
             return
         if self.path == "/apply" and observed is not LEGAL_HOLD_ON:
             self.respond(
                 HTTPStatus.CONFLICT,
                 {"classification": "LEGAL_HOLD_READBACK_FAILED"},
+                target=target,
             )
             return
         self.respond(

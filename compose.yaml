@@ -68,6 +68,8 @@ services:
   legal-hold-applier:
     build:
       context: ./apps/legal-hold-applier/src
+      additional_contexts:
+        smartcoat-packages: ./packages
     restart: unless-stopped
     depends_on:
       minio-bootstrap:
@@ -91,6 +93,8 @@ services:
   postgres-migrate:
     build:
       context: ./apps/api/src
+      additional_contexts:
+        smartcoat-packages: ./packages
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,6 +110,8 @@ services:
   postgres-role-provision:
     build:
       context: ./apps/api/src
+      additional_contexts:
+        smartcoat-packages: ./packages
     depends_on:
       postgres:
         condition: service_healthy
@@ -126,6 +132,8 @@ services:
   api:
     build:
       context: ./apps/api/src
+      additional_contexts:
+        smartcoat-packages: ./packages
     restart: unless-stopped
     depends_on:
       postgres:
@@ -184,6 +192,7 @@ services:
       context: ./apps/ocr-worker/src
       additional_contexts:
         api-source: ./apps/api/src
+        smartcoat-packages: ./packages
     restart: unless-stopped
     depends_on:
       postgres:

@@ -6,7 +6,7 @@ import hmac
 import json
 import time
 
-from operational_logging import log_event
+from packages.smartcoat_logging.operational_logging import log_event
 
 
 class InvalidSession(ValueError):

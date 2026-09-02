@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable, Protocol
 
-from operational_logging import log_event
+from packages.smartcoat_logging.operational_logging import log_event
 from retention_policy import (
     CANONICAL_RETENTION_CLASSES,
     RETENTION_POLICY_VERSION,

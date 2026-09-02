@@ -13,10 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from domain import (  # noqa: E402
     Actor,
+    DEFAULT_OCR_MAX_ATTEMPTS,
     IngestionService,
     OCRDomainService,
     OCRRecoveryService,
     StateConflict,
+    configured_ocr_max_attempts,
 )
 from fakes import MemoryRepository, MemoryRetentionEnforcer, MemoryStorage  # noqa: E402
 
@@ -150,6 +152,24 @@ class OCRFailedRecoveryTests(unittest.TestCase):
         ):
             self.assertIn(column, rbac)
         self.assertIn('("smartcoat_ocr", "uploads", "state")', rbac)
+
+    def test_retry_limit_configuration_defaults_safely(self) -> None:
+        self.assertEqual(DEFAULT_OCR_MAX_ATTEMPTS, configured_ocr_max_attempts({}))
+        for malformed in ("not-an-integer", "3.5", "", "0", "-4"):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(
+                    DEFAULT_OCR_MAX_ATTEMPTS,
+                    configured_ocr_max_attempts({"OCR_MAX_ATTEMPTS": malformed}),
+                )
+        self.assertEqual(5, configured_ocr_max_attempts({"OCR_MAX_ATTEMPTS": "5"}))
+
+    def test_retry_limit_is_read_once_during_api_startup(self) -> None:
+        main = (SOURCE / "main.py").read_text(encoding="utf-8")
+        self.assertEqual(1, main.count("configured_ocr_max_attempts()"))
+        self.assertIn(
+            "OCRRecoveryService(ocr_repository, OCR_MAX_ATTEMPTS)",
+            main,
+        )
 
 
 if __name__ == "__main__":

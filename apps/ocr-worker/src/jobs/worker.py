@@ -12,7 +12,11 @@ from extract.excel import extract_workbook
 from extract.paddle_engine import CONFIGURATION, ENGINE_VERSION, PaddleEngine
 from extract.tesseract_benchmark import benchmark
 from minio import Minio
-from operational_logging import configure_service, correlation_scope, log_event
+from packages.smartcoat_logging.operational_logging import (
+    configure_service,
+    correlation_scope,
+    log_event,
+)
 from preprocess.documents import MAX_IMAGE_SIDE, PREPROCESSING_VERSION, preprocess_source
 from storage import MinioObjectStorage
 

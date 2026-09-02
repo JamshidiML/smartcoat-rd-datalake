@@ -1,32 +1,22 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import unittest
 from pathlib import Path
 
+from packages.smartcoat_logging import operational_logging
+
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
-LOGGER_SOURCE = SOURCE / "operational_logging.py"
-
-
-def load_logging_module():
-    spec = importlib.util.spec_from_file_location("ocr_operational_logging", LOGGER_SOURCE)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Could not load OCR operational logging module")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 class OCRWorkerOperationalLoggingTests(unittest.TestCase):
     def test_worker_uses_propagated_job_id_as_correlation(self) -> None:
-        module = load_logging_module()
         lines: list[str] = []
-        logger = module.StructuredLogger("ocr-worker", sink=lines.append)
+        logger = operational_logging.StructuredLogger("ocr-worker", sink=lines.append)
         job_id = "0198a000-0000-7000-8000-000000000777"
 
-        with module.correlation_scope(job_id):
+        with operational_logging.correlation_scope(job_id):
             logger.emit(
                 "INFO",
                 "ocr.job.started",

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from operational_logging import log_event
+from packages.smartcoat_logging.operational_logging import log_event
 
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024

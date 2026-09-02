@@ -7,6 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PADDLE_HOME=/opt/paddle-models \
     HOME=/opt/paddle-home
 WORKDIR /worker
+COPY --from=smartcoat-packages smartcoat_logging /worker/packages/smartcoat_logging
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libgl1 libglib2.0-0 libgomp1 poppler-utils tesseract-ocr tesseract-ocr-deu tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*

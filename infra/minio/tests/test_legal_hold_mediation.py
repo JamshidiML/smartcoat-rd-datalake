@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
+import os
 import re
 import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from packages.smartcoat_logging import operational_logging
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -28,6 +34,33 @@ def load_contract():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    return module
+
+
+def load_mediator():
+    contract = load_contract()
+    fake_minio = types.ModuleType("minio")
+
+    class ConstructionClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    fake_minio.Minio = ConstructionClient
+    environment = {
+        "MINIO_HOLD_APPLIER_ENDPOINT": "minio:9000",
+        "MINIO_HOLD_APPLIER_ACCESS_KEY": "synthetic-mediator-access",
+        "MINIO_HOLD_APPLIER_SECRET_KEY": "synthetic-mediator-secret",
+        "LEGAL_HOLD_APPLIER_CALL_TOKEN": "T" * 48,
+    }
+    spec = importlib.util.spec_from_file_location("legal_hold_mediator", APPLIER / "main.py")
+    if spec is None or spec.loader is None:
+        raise AssertionError("mediator implementation could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    with (
+        patch.dict(os.environ, environment),
+        patch.dict(sys.modules, {"contract": contract, "minio": fake_minio}),
+    ):
+        spec.loader.exec_module(module)
     return module
 
 
@@ -210,3 +243,120 @@ class RuntimeBoundaryTests(unittest.TestCase):
         source = (MINIO / "tests" / "live_legal_hold_mediation_acceptance.py").read_text()
         self.assertIn("--confirm-disposable-synthetic-legal-hold-mediation-run", source)
         self.assertIn("PASS_LEGAL_HOLD_CALLER_AUTH_REMEDIATION", source)
+
+
+class MediatorLoggingTests(unittest.TestCase):
+    class Client:
+        def __init__(self) -> None:
+            self.apply_calls: list[tuple[str, str, str]] = []
+
+        def enable_object_legal_hold(
+            self, bucket: str, object_key: str, *, version_id: str
+        ) -> None:
+            self.apply_calls.append((bucket, object_key, version_id))
+
+        def is_object_legal_hold_enabled(
+            self, bucket: str, object_key: str, *, version_id: str
+        ) -> bool:
+            return True
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mediator = load_mediator()
+
+    def request(
+        self,
+        *,
+        token: str,
+        payload: dict[str, str],
+        client: Client | None = None,
+    ) -> tuple[int, dict, dict, str]:
+        encoded = json.dumps(payload).encode()
+        handler = object.__new__(self.mediator.Handler)
+        handler.path = "/apply"
+        handler.command = "POST"
+        handler.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Length": str(len(encoded)),
+        }
+        handler.rfile = io.BytesIO(encoded)
+        handler.wfile = io.BytesIO()
+        observed_status: list[int] = []
+        handler.send_response = lambda status: observed_status.append(int(status))
+        handler.send_header = lambda *_args: None
+        handler.end_headers = lambda: None
+        self.mediator.CLIENT = client or self.Client()
+
+        lines: list[str] = []
+        original_logger = operational_logging._LOGGER
+        operational_logging._LOGGER = operational_logging.StructuredLogger(
+            "legal-hold-applier", sink=lines.append
+        )
+        try:
+            handler.do_POST()
+        finally:
+            operational_logging._LOGGER = original_logger
+
+        self.assertEqual(1, len(lines))
+        return (
+            observed_status[0],
+            json.loads(handler.wfile.getvalue()),
+            json.loads(lines[0]),
+            lines[0],
+        )
+
+    def valid(self) -> dict[str, str]:
+        return {
+            "bucket": "sc-rd-bronze-originals",
+            "object_key": "rd/synthetic/original.bin",
+            "version_id": "8f9084d8-8a5e-4a62-9090-77aa11bb22cc",
+        }
+
+    def test_successful_apply_emits_one_structured_record(self) -> None:
+        client = self.Client()
+        status, _body, record, _line = self.request(
+            token=self.mediator.CALL_TOKEN,
+            payload=self.valid(),
+            client=client,
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(record["timestamp_utc"].endswith("Z"))
+        self.assertEqual("INFO", record["level"])
+        self.assertEqual("legal_hold.request", record["event"])
+        self.assertEqual("legal-hold-applier", record["service"])
+        self.assertEqual("LEGAL_HOLD_APPLIED", record["classification"])
+        self.assertEqual("SUCCESS", record["outcome"])
+        self.assertEqual(self.valid()["bucket"], record["bucket"])
+        self.assertEqual(self.valid()["object_key"], record["object_key"])
+        self.assertEqual(self.valid()["version_id"], record["version_id"])
+        self.assertEqual(1, len(client.apply_calls))
+
+    def test_rejected_apply_logs_its_classification(self) -> None:
+        status, _body, record, _line = self.request(
+            token=self.mediator.CALL_TOKEN,
+            payload={},
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("REQUEST_REJECTED", record["classification"])
+        self.assertEqual("REJECTED", record["outcome"])
+
+    def test_unauthenticated_request_logs_without_any_credential_material(self) -> None:
+        presented = "UNAUTHORIZED-CALLER-TOKEN-1234567890-abcdef"
+        status, _body, record, line = self.request(
+            token=presented,
+            payload=self.valid(),
+        )
+        self.assertEqual(401, status)
+        self.assertEqual("CALLER_AUTHENTICATION_REQUIRED", record["classification"])
+        self.assertEqual("REJECTED", record["outcome"])
+        for prohibited in (
+            presented,
+            presented[:20],
+            presented[-20:],
+            self.mediator.CALL_TOKEN,
+            "synthetic-mediator-access",
+            "synthetic-mediator-secret",
+            "Authorization",
+            "Bearer",
+        ):
+            self.assertNotIn(prohibited, line)

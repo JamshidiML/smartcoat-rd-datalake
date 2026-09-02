@@ -9,7 +9,7 @@ from psycopg.rows import dict_row
 
 from domain import StateConflict
 from identifiers import uuid7
-from operational_logging import log_event
+from packages.smartcoat_logging.operational_logging import log_event
 
 
 class PostgresRepository:
