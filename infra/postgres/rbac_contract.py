@@ -36,6 +36,16 @@ class PositivePathRequirement:
     columns: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class PositiveSchemaRequirement:
+    """One schema privilege required by a production database path."""
+
+    role: str
+    code_path: str
+    schema: str
+    privilege: str
+
+
 RUNTIME_ROLES: Mapping[str, RuntimeRole] = MappingProxyType(
     {
         "ingestion": RuntimeRole(
@@ -373,6 +383,7 @@ POSITIVE_PATH_REQUIREMENTS = (
     *_requirements(
         "smartcoat_backup", "restore_drill.backup", "pg_dump",
         ("applied_migrations", "SELECT"), ("adoption_decisions", "SELECT"),
+        ("legal_upload_transitions", "SELECT"),
     ),
 )
 
@@ -383,12 +394,38 @@ MIGRATION_METADATA_PRIVILEGES = frozenset(
     }
 )
 
+STATE_METADATA_PRIVILEGES = frozenset(
+    {
+        ("smartcoat_backup", "legal_upload_transitions", "SELECT"),
+    }
+)
+
+SCHEMA_USAGE_PRIVILEGES = frozenset(
+    {
+        ("smartcoat_backup", "smartcoat_migrations", "USAGE"),
+        ("smartcoat_backup", "smartcoat_state", "USAGE"),
+    }
+)
+
+POSITIVE_SCHEMA_REQUIREMENTS = (
+    PositiveSchemaRequirement(
+        "smartcoat_backup", "restore_drill.backup", "smartcoat_migrations", "USAGE"
+    ),
+    PositiveSchemaRequirement(
+        "smartcoat_backup", "restore_drill.backup", "smartcoat_state", "USAGE"
+    ),
+)
+
 
 def positive_requirement_is_granted(requirement: PositivePathRequirement) -> bool:
     """Return whether the exact runtime grant matrix satisfies a requirement."""
 
     table_grant = (requirement.role, requirement.table, requirement.privilege)
-    if table_grant in TABLE_PRIVILEGES or table_grant in MIGRATION_METADATA_PRIVILEGES:
+    if (
+        table_grant in TABLE_PRIVILEGES
+        or table_grant in MIGRATION_METADATA_PRIVILEGES
+        or table_grant in STATE_METADATA_PRIVILEGES
+    ):
         return True
     if not requirement.columns:
         return False
@@ -411,6 +448,21 @@ def missing_positive_path_requirements() -> tuple[PositivePathRequirement, ...]:
         requirement
         for requirement in POSITIVE_PATH_REQUIREMENTS
         if not positive_requirement_is_granted(requirement)
+    )
+
+
+def missing_positive_schema_requirements() -> tuple[PositiveSchemaRequirement, ...]:
+    """Return required schema privileges absent from the exact grant contract."""
+
+    return tuple(
+        requirement
+        for requirement in POSITIVE_SCHEMA_REQUIREMENTS
+        if (
+            requirement.role,
+            requirement.schema,
+            requirement.privilege,
+        )
+        not in SCHEMA_USAGE_PRIVILEGES
     )
 
 PROTECTED_APPEND_ONLY_TABLES = (

@@ -20,4 +20,9 @@ GRANT SELECT (
     object_version_id
 ) ON bronze_objects TO smartcoat_review;
 
+-- pg_dump locks and reads the database-owned transition graph as well as the
+-- public application tables and migration metadata.
+GRANT USAGE ON SCHEMA smartcoat_state TO smartcoat_backup;
+GRANT SELECT ON smartcoat_state.legal_upload_transitions TO smartcoat_backup;
+
 COMMIT;

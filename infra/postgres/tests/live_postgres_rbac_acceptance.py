@@ -775,7 +775,7 @@ print(json.dumps({"validated": True}, sort_keys=True))
                     SELECT grantee,table_schema,table_name,privilege_type
                     FROM information_schema.table_privileges
                     WHERE grantee IN ('smartcoat_ingestion','smartcoat_ocr','smartcoat_review','smartcoat_backup')
-                      AND table_schema IN ('public','smartcoat_migrations')
+                      AND table_schema IN ('public','smartcoat_migrations','smartcoat_state')
                 ) p
                 """,
             ),
@@ -790,10 +790,41 @@ print(json.dumps({"validated": True}, sort_keys=True))
         } | {
             (role, "smartcoat_migrations", table, privilege)
             for role, table, privilege in rbac_contract.MIGRATION_METADATA_PRIVILEGES
+        } | {
+            (role, "smartcoat_state", table, privilege)
+            for role, table, privilege in rbac_contract.STATE_METADATA_PRIVILEGES
         }
         require(
             observed_table_privileges == expected_table_privileges,
             "Catalog table grants differ from the exact M0-R02 matrix",
+        )
+        schema_privileges = self._json_value(
+            "catalog_nonpublic_schema_privileges",
+            self._admin_value(
+                "catalog_nonpublic_schema_privileges",
+                """
+                SELECT COALESCE(json_agg(row_to_json(p) ORDER BY role_name,schema_name,privilege),'[]')::text
+                FROM (
+                    SELECT role_name,schema_name,privilege
+                    FROM (VALUES
+                      ('smartcoat_ingestion'),('smartcoat_ocr'),
+                      ('smartcoat_review'),('smartcoat_backup')
+                    ) roles(role_name)
+                    CROSS JOIN (VALUES
+                      ('smartcoat_migrations'),('smartcoat_state')
+                    ) schemas(schema_name)
+                    CROSS JOIN (VALUES ('USAGE'),('CREATE')) privileges(privilege)
+                    WHERE has_schema_privilege(role_name,schema_name,privilege)
+                ) p
+                """,
+            ),
+        )
+        require(
+            {
+                (row["role_name"], row["schema_name"], row["privilege"])
+                for row in schema_privileges
+            } == rbac_contract.SCHEMA_USAGE_PRIVILEGES,
+            "Catalog non-public schema grants differ from the positive-path contract",
         )
         column_privileges = self._json_value(
             "catalog_column_privileges",
@@ -1042,6 +1073,7 @@ print(json.dumps({"validated": True}, sort_keys=True))
         backup_reads += (
             "\nSELECT count(*) FROM smartcoat_migrations.applied_migrations;"
             "\nSELECT count(*) FROM smartcoat_migrations.adoption_decisions;"
+            "\nSELECT count(*) FROM smartcoat_state.legal_upload_transitions;"
         )
         self._role_sql(
             "positive_backup_reads_all_evidence",

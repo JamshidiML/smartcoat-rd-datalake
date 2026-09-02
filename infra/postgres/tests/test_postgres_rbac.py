@@ -102,6 +102,7 @@ class RuntimeRoleContractTests(unittest.TestCase):
     def test_positive_path_requirements_are_fully_granted(self) -> None:
         self.assertGreater(len(rbac_contract.POSITIVE_PATH_REQUIREMENTS), 100)
         self.assertEqual((), rbac_contract.missing_positive_path_requirements())
+        self.assertEqual((), rbac_contract.missing_positive_schema_requirements())
         self.assertEqual(
             {
                 ("smartcoat_ocr", "bronze_objects", "bronze_object_id"),
@@ -168,6 +169,13 @@ class RuntimeRoleContractTests(unittest.TestCase):
         )
         self.assertIn("ON bronze_objects TO smartcoat_ocr", sql)
         self.assertIn("ON bronze_objects TO smartcoat_review", sql)
+        self.assertIn(
+            "GRANT USAGE ON SCHEMA smartcoat_state TO smartcoat_backup", sql
+        )
+        self.assertIn(
+            "GRANT SELECT ON smartcoat_state.legal_upload_transitions TO smartcoat_backup",
+            sql,
+        )
         self.assertNotRegex(
             sql,
             r"(?i)GRANT\s+(?:ALL|INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER)",
@@ -190,6 +198,19 @@ class RuntimeRoleContractTests(unittest.TestCase):
         )
         self.assertFalse(
             any(item[0] == "smartcoat_backup" for item in rbac_contract.COLUMN_UPDATE_PRIVILEGES)
+        )
+        self.assertEqual(
+            {
+                ("smartcoat_backup", "legal_upload_transitions", "SELECT"),
+            },
+            rbac_contract.STATE_METADATA_PRIVILEGES,
+        )
+        self.assertEqual(
+            {
+                ("smartcoat_backup", "smartcoat_migrations", "USAGE"),
+                ("smartcoat_backup", "smartcoat_state", "USAGE"),
+            },
+            rbac_contract.SCHEMA_USAGE_PRIVILEGES,
         )
         for role in rbac_contract.ROLE_NAMES:
             for table in rbac_contract.PROTECTED_APPEND_ONLY_TABLES:
