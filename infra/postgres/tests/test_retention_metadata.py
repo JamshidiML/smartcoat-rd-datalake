@@ -33,7 +33,7 @@ class RetentionMetadataMigrationTests(unittest.TestCase):
         import migrate
 
         discovered = migrate.discover_migrations(ROOT / "infra/postgres/migrations")
-        self.assertEqual([1, 2, 3, 4, 5, 6, 7, 8], [item.version for item in discovered])
+        self.assertEqual([1, 2, 3, 4, 5, 6, 7, 8, 9], [item.version for item in discovered])
         by_version = {item.version: item for item in discovered}
         self.assertEqual("expand_retention_metadata", by_version[5].name)
 

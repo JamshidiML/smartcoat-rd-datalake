@@ -70,6 +70,21 @@ class RetentionPolicyTests(unittest.TestCase):
             retention.retain_until_for(retention.PERMANENT, source),
         )
 
+    def test_long_term_ten_year_calendar_anchors(self) -> None:
+        cases = (
+            (datetime(2020, 1, 1, tzinfo=UTC), datetime(2030, 1, 1, tzinfo=UTC)),
+            (datetime(2024, 2, 29, tzinfo=UTC), datetime(2034, 2, 28, tzinfo=UTC)),
+            (datetime(2020, 2, 29, tzinfo=UTC), datetime(2030, 2, 28, tzinfo=UTC)),
+            (datetime(2021, 3, 1, tzinfo=UTC), datetime(2031, 3, 1, tzinfo=UTC)),
+            (datetime(2016, 2, 29, tzinfo=UTC), datetime(2026, 2, 28, tzinfo=UTC)),
+        )
+        for anchor, expected in cases:
+            with self.subTest(anchor=anchor.isoformat()):
+                self.assertEqual(
+                    expected,
+                    retention.retain_until_for(retention.LONG_TERM_10Y, anchor),
+                )
+
     def test_short_90d_is_exactly_2160_utc_hours(self) -> None:
         source = datetime(
             2026,

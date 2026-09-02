@@ -56,6 +56,7 @@ def main() -> None:
                     "ocr.job.failed",
                     ingestion_id=str(job["ingestion_id"]),
                     ocr_job_id=str(job["ocr_job_id"]),
+                    object_version_id=str(job["original_object_version_id"]),
                     duration_ms=round((time.perf_counter() - started) * 1000, 3),
                     error_type=type(exc).__name__,
                 )
