@@ -1,7 +1,7 @@
 BEGIN;
 
--- The OCR worker formerly held table-wide Bronze read authority.  Its complete
--- active path needs only pair joins, exact-version lookup, and get_upload().
+-- This defensive, idempotent REVOKE removes any pre-existing table-wide Bronze
+-- read authority before the exact positive-path column grants are applied.
 REVOKE SELECT ON TABLE bronze_objects FROM smartcoat_ocr, smartcoat_review;
 
 GRANT SELECT (
