@@ -25,8 +25,12 @@ from rbac_contract import (
     ROLE_MEMBERSHIP_QUERY,
     ROLE_NAMES,
     RUNTIME_ROLES,
+    SCHEMA_USAGE_PRIVILEGES,
+    STATE_METADATA_PRIVILEGES,
     TABLE_PRIVILEGES,
     expected_role_attributes,
+    missing_positive_path_requirements,
+    missing_positive_schema_requirements,
     password_values,
 )
 
@@ -161,7 +165,7 @@ def validate_installed_contract(connection: Any) -> None:
     column_rows = connection.execute(
         """
         SELECT grantee, table_name, column_name
-        FROM information_schema.column_privileges
+        FROM information_schema.column_privileges AS column_grant
         WHERE table_schema = 'public'
           AND privilege_type = 'UPDATE'
           AND grantee = ANY(%s)
@@ -175,18 +179,49 @@ def validate_installed_contract(connection: Any) -> None:
     select_column_rows = connection.execute(
         """
         SELECT grantee, table_name, column_name
-        FROM information_schema.column_privileges
+        FROM information_schema.column_privileges AS column_grant
         WHERE table_schema = 'public'
-          AND table_name = 'audit_events'
           AND privilege_type = 'SELECT'
-          AND grantee = 'smartcoat_review'
+          AND grantee = ANY(%s)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM information_schema.table_privileges AS table_grant
+              WHERE table_grant.table_schema = column_grant.table_schema
+                AND table_grant.table_name = column_grant.table_name
+                AND table_grant.grantee = column_grant.grantee
+                AND table_grant.privilege_type = 'SELECT'
+          )
         ORDER BY grantee, table_name, column_name
-        """
+        """,
+        (list(ROLE_NAMES),),
     ).fetchall()
     if frozenset(tuple(row) for row in select_column_rows) != COLUMN_SELECT_PRIVILEGES:
         raise ProvisioningError(
-            "Column-select grants do not match the review retry-evidence contract"
+            "Column-select grants do not match the positive-path contract"
         )
+
+    if missing_positive_path_requirements():
+        raise ProvisioningError(
+            "Runtime grants do not satisfy every required positive path"
+        )
+    if missing_positive_schema_requirements():
+        raise ProvisioningError(
+            "Runtime schema grants do not satisfy every required positive path"
+        )
+
+    for role in ROLE_NAMES:
+        for schema in ("smartcoat_migrations", "smartcoat_state"):
+            for privilege in ("USAGE", "CREATE"):
+                expected = (role, schema, privilege) in SCHEMA_USAGE_PRIVILEGES
+                observed = _single_boolean(
+                    connection,
+                    "SELECT has_schema_privilege(%s, %s, %s)",
+                    (role, schema, privilege),
+                )
+                if observed != expected:
+                    raise ProvisioningError(
+                        f"Unexpected {privilege} privilege shape for {role} on {schema}"
+                    )
 
     metadata_rows = connection.execute(
         """
@@ -200,6 +235,21 @@ def validate_installed_contract(connection: Any) -> None:
     ).fetchall()
     if frozenset(tuple(row) for row in metadata_rows) != MIGRATION_METADATA_PRIVILEGES:
         raise ProvisioningError("Migration-metadata grants do not match the read-only backup contract")
+
+    state_rows = connection.execute(
+        """
+        SELECT grantee, table_name, privilege_type
+        FROM information_schema.table_privileges
+        WHERE table_schema = 'smartcoat_state'
+          AND grantee = ANY(%s)
+        ORDER BY grantee, table_name, privilege_type
+        """,
+        (list(ROLE_NAMES),),
+    ).fetchall()
+    if frozenset(tuple(row) for row in state_rows) != STATE_METADATA_PRIVILEGES:
+        raise ProvisioningError(
+            "State-metadata grants do not match the read-only backup contract"
+        )
 
 
 def provision(environment: Mapping[str, str]) -> None:

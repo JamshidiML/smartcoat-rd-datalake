@@ -21,9 +21,9 @@ class BronzePairMigrationTests(unittest.TestCase):
 
     def test_collision_free_monotonic_migration_identity(self) -> None:
         names = sorted(path.name for path in MIGRATIONS.glob("[0-9][0-9][0-9][0-9]__*.sql"))
-        self.assertEqual(list(range(1, 10)), [int(name[:4]) for name in names])
+        self.assertEqual(list(range(1, 11)), [int(name[:4]) for name in names])
         self.assertIn("0008__enforce_bronze_pair_commit_and_orphans.sql", names)
-        self.assertEqual("0009__add_operator_ocr_retry_transition.sql", names[-1])
+        self.assertEqual("0010__grant_positive_path_bronze_reads.sql", names[-1])
 
     def test_pair_orphan_and_reconciliation_evidence_are_append_only(self) -> None:
         for table in (

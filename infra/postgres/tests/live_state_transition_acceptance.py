@@ -38,7 +38,10 @@ TRANSITION_MIGRATION = (
 )
 MIGRATIONS = ROOT / "infra/postgres/migrations"
 RECOVERY_MIGRATION = MIGRATIONS / "0009__add_operator_ocr_retry_transition.sql"
-EXPECTED_MIGRATION_VERSIONS = tuple(range(1, 10))
+POSITIVE_GRANT_MIGRATION = (
+    MIGRATIONS / "0010__grant_positive_path_bronze_reads.sql"
+)
+EXPECTED_MIGRATION_VERSIONS = tuple(range(1, 11))
 
 RESULT_PASS = "PASS_M0_R03"
 RESULT_PRODUCT_FAILURE = "FAIL_PRODUCT_CONTRACT"
@@ -131,6 +134,7 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
         )
         self.transition_sha256 = sha256_path(TRANSITION_MIGRATION)
         self.recovery_sha256 = sha256_path(RECOVERY_MIGRATION)
+        self.positive_grant_sha256 = sha256_path(POSITIVE_GRANT_MIGRATION)
         self.ingestion_password = secrets.token_hex(24)
         self.ocr_password = secrets.token_hex(24)
         self.review_password = secrets.token_hex(24)
@@ -911,14 +915,14 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
         apply_result = self._run_migration("apply_complete_transition_chain", "apply")
         self._require(
             apply_result.returncode == 0
-            and "discovered=9" in apply_result.stdout
+            and "discovered=10" in apply_result.stdout
             and "already_applied=1" in apply_result.stdout
-            and "applied_now=8" in apply_result.stdout,
-            "Complete migration chain through version 9 did not apply exactly once",
+            and "applied_now=9" in apply_result.stdout,
+            "Complete migration chain through version 10 did not apply exactly once",
         )
         ledger = self._ledger_rows("transition_ledger")
         self._require(
-            len(ledger) == 9
+            len(ledger) == 10
             and ledger[0]["version"] == 1
             and ledger[0]["sha256"] == accepted.EXPECTED_BASELINE_SHA256
             and ledger[2]["version"] == 3
@@ -926,7 +930,10 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
             and ledger[2]["sha256"] == self.transition_sha256
             and ledger[8]["version"] == 9
             and ledger[8]["name"] == "add_operator_ocr_retry_transition"
-            and ledger[8]["sha256"] == self.recovery_sha256,
+            and ledger[8]["sha256"] == self.recovery_sha256
+            and ledger[9]["version"] == 10
+            and ledger[9]["name"] == "grant_positive_path_bronze_reads"
+            and ledger[9]["sha256"] == self.positive_grant_sha256,
             "Transition migration ledger evidence is incorrect",
         )
         self._require(
@@ -965,8 +972,8 @@ class LiveStateTransitionAcceptance(accepted.LiveMigrationLifecycleAcceptance):
         reapply = self._run_migration("idempotent_transition_reapply", "apply")
         self._require(
             reapply.returncode == 0
-            and "discovered=9" in reapply.stdout
-            and "already_applied=9" in reapply.stdout
+            and "discovered=10" in reapply.stdout
+            and "already_applied=10" in reapply.stdout
             and "applied_now=0" in reapply.stdout,
             "Transition migration reapplication was not idempotent",
         )

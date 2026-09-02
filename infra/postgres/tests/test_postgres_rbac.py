@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -15,6 +16,9 @@ POSTGRES_ROOT = ROOT / "infra/postgres"
 MIGRATION = POSTGRES_ROOT / "migrations/0002__separate_runtime_roles.sql"
 COMPATIBILITY_MIGRATION = (
     POSTGRES_ROOT / "migrations/0006__grant_review_audit_evidence_read.sql"
+)
+POSITIVE_PATH_MIGRATION = (
+    POSTGRES_ROOT / "migrations/0010__grant_positive_path_bronze_reads.sql"
 )
 PROVISIONER = POSTGRES_ROOT / "provision_runtime_roles.py"
 LIVE_ACCEPTANCE = POSTGRES_ROOT / "tests/live_postgres_rbac_acceptance.py"
@@ -74,7 +78,11 @@ class RuntimeRoleContractTests(unittest.TestCase):
                 ("smartcoat_review", "audit_events", "details_json"),
                 ("smartcoat_review", "audit_events", "new_state"),
             },
-            rbac_contract.COLUMN_SELECT_PRIVILEGES,
+            {
+                item
+                for item in rbac_contract.COLUMN_SELECT_PRIVILEGES
+                if item[:2] == ("smartcoat_review", "audit_events")
+            },
         )
         self.assertNotIn(
             ("smartcoat_review", "audit_events", "SELECT"),
@@ -91,6 +99,92 @@ class RuntimeRoleContractTests(unittest.TestCase):
             r"(?i)\b(UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP|EXECUTE|OWNERSHIP)\b",
         )
 
+    def test_positive_path_requirements_are_fully_granted(self) -> None:
+        self.assertGreater(len(rbac_contract.POSITIVE_PATH_REQUIREMENTS), 100)
+        self.assertEqual((), rbac_contract.missing_positive_path_requirements())
+        self.assertEqual((), rbac_contract.missing_positive_schema_requirements())
+        self.assertEqual(
+            {
+                ("smartcoat_ocr", "bronze_objects", "bronze_object_id"),
+                ("smartcoat_ocr", "bronze_objects", "ingestion_id"),
+                ("smartcoat_ocr", "bronze_objects", "object_kind"),
+                ("smartcoat_ocr", "bronze_objects", "object_version_id"),
+                ("smartcoat_review", "bronze_objects", "ingestion_id"),
+                ("smartcoat_review", "bronze_objects", "object_kind"),
+                ("smartcoat_review", "bronze_objects", "object_version_id"),
+            },
+            {
+                item
+                for item in rbac_contract.COLUMN_SELECT_PRIVILEGES
+                if item[1] == "bronze_objects"
+            },
+        )
+        for role in ("smartcoat_ocr", "smartcoat_review"):
+            self.assertNotIn(
+                (role, "bronze_objects", "SELECT"),
+                rbac_contract.TABLE_PRIVILEGES,
+            )
+
+    def test_repository_sql_tables_are_declared_by_positive_path_contract(self) -> None:
+        source = (ROOT / "apps/api/src/database.py").read_text()
+        methods = {
+            node.name: node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        declared_methods = {
+            requirement.repository_method
+            for requirement in rbac_contract.POSITIVE_PATH_REQUIREMENTS
+            if requirement.repository_method != "pg_dump"
+        }
+        known_tables = set(rbac_contract.PUBLIC_TABLES)
+        for method_name in declared_methods:
+            self.assertIn(method_name, methods)
+            sql_text = "\n".join(
+                node.value
+                for node in ast.walk(methods[method_name])
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            ).lower()
+            observed = {
+                table
+                for table in known_tables
+                if table in sql_text
+            }
+            declared = {
+                requirement.table
+                for requirement in rbac_contract.POSITIVE_PATH_REQUIREMENTS
+                if requirement.repository_method == method_name
+            }
+            self.assertLessEqual(
+                observed,
+                declared,
+                f"{method_name} touches an undeclared positive-path table",
+            )
+
+    def test_positive_path_migration_is_column_read_only(self) -> None:
+        sql = POSITIVE_PATH_MIGRATION.read_text()
+        self.assertIn(
+            "REVOKE SELECT ON TABLE bronze_objects FROM smartcoat_ocr, smartcoat_review",
+            sql,
+        )
+        self.assertIn("ON bronze_objects TO smartcoat_ocr", sql)
+        self.assertIn("ON bronze_objects TO smartcoat_review", sql)
+        self.assertIn(
+            "GRANT USAGE ON SCHEMA smartcoat_state TO smartcoat_backup", sql
+        )
+        self.assertIn(
+            "GRANT SELECT ON smartcoat_state.legal_upload_transitions TO smartcoat_backup",
+            sql,
+        )
+        self.assertNotRegex(
+            sql,
+            r"(?i)GRANT\s+(?:ALL|INSERT|UPDATE|DELETE|TRUNCATE|REFERENCES|TRIGGER)",
+        )
+        self.assertNotRegex(
+            sql,
+            r"(?i)GRANT\s+SELECT\s+ON\s+(?:TABLE\s+)?bronze_objects",
+        )
+
     def test_backup_is_select_only_and_append_only_tables_have_no_mutation_grants(self) -> None:
         backup = {
             item for item in rbac_contract.TABLE_PRIVILEGES if item[0] == "smartcoat_backup"
@@ -104,6 +198,19 @@ class RuntimeRoleContractTests(unittest.TestCase):
         )
         self.assertFalse(
             any(item[0] == "smartcoat_backup" for item in rbac_contract.COLUMN_UPDATE_PRIVILEGES)
+        )
+        self.assertEqual(
+            {
+                ("smartcoat_backup", "legal_upload_transitions", "SELECT"),
+            },
+            rbac_contract.STATE_METADATA_PRIVILEGES,
+        )
+        self.assertEqual(
+            {
+                ("smartcoat_backup", "smartcoat_migrations", "USAGE"),
+                ("smartcoat_backup", "smartcoat_state", "USAGE"),
+            },
+            rbac_contract.SCHEMA_USAGE_PRIVILEGES,
         )
         for role in rbac_contract.ROLE_NAMES:
             for table in rbac_contract.PROTECTED_APPEND_ONLY_TABLES:
