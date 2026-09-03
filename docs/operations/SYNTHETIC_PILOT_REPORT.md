@@ -4,34 +4,37 @@
 
 **Result: `FAIL_SYNTHETIC_END_TO_END_PILOT`**
 
-The resumed pilot stopped at its first acceptance-harness failure, as required.
-It did not reveal a new product-contract defect. The production-bound API
-recorded three pre-run OCR failures for fixture 2 and rejected the next retry
-with HTTP `409` and the reason `OCR retry limit reached (3 attempts); operator
-review is required`. This is direct evidence that `P0-16-DEFECT-01` is fixed.
+The repaired evidence instrument completed all ten fixture paths and the first
+three fault scenarios. It then stopped at the first new product-contract
+failure, as required.
 
-The temporary HTTP evidence client mishandled expected non-2xx responses. Its
-`urllib.error.HTTPError` handler populated a result, but the serialization and
-print logic was in the `try` statement's `else` block. Python does not execute
-that block after a handled exception. The client therefore returned no stdout
-for the expected `409`, and the harness classified it as
-`NO_CLIENT_RESULT`. The API's sanitized structured log retained the actual
-`409` outcome.
+Defect identifier: `P0-16-DEFECT-02`.
 
-This is `FAIL_VERIFICATION_HARNESS`, not `FAIL_PRODUCT_CONTRACT`. WP10 says to
-stop and report after a pilot failure, so the harness was not repaired and the
-live pilot was not rerun. Fixtures 3–10 and the seven fault scenarios remain
-unexecuted in this run.
+Calling Bronze reconciliation for an already `VERIFIED` ingestion returned HTTP
+`409` with `OCR cannot be queued before a successful Bronze pair commit`, rather
+than the intended idempotent `ALREADY_COMMITTED` result. Source inspection
+confirms the cause: `BronzeIngestionService.reconcile()` detects the existing
+pair but calls `ensure_ocr_queued()` before returning `ALREADY_COMMITTED`.
+`ensure_ocr_queued()` rejects every state except `BRONZE_COMMITTED` and
+`OCR_QUEUED` before it checks for the existing OCR job. Consequently the replay
+contract becomes unreachable once a completed ingestion advances to
+`SILVER_DRAFT_READY`, `UNDER_HUMAN_REVIEW`, `VERIFIED`, or `REVIEW_REJECTED`.
 
-## 1. Execution identity and checkpoints
+This is `FAIL_PRODUCT_CONTRACT`, not a harness failure. No product fix was made,
+and the pilot was not rerun after the finding. The remaining fault scenarios
+were not executed.
 
-- Date: `2026-09-03`
+`P0-16-DEFECT-01` remains closed: pre-run OCR failures were counted exactly
+once, and the retry bound was enforced at three attempts in this live run.
+
+## 1. Execution identity
+
+- Execution date UTC: `2026-09-03`
+- Local report date (Europe/Berlin): `2026-09-04`
+- Branch: `agent/wp10-synthetic-pilot`
+- Candidate commit: `45a299ab76699d9da03a6b1e179ffef635ae8fee`
 - Integration base: `a824ad1d0bb9d3b36187162c5ba1ee2c800bbfab`
-- Execution branch: `agent/wp10-synthetic-pilot`
-- Fixture/report checkpoint: `f363eae`
-- Solo-review governance prerequisite: `3a343a3`
-- P0-16 repair checkpoint: `8d1531f3f055d1eb3af6babff99bacc2be6ee82a`
-- Disposable project: `bronzepair-a534a9d2ae19`
+- Disposable project: `bronzepair-d6884a43cf6e`
 - Synthetic data only: yes
 - Existing containers, volumes, networks, `./.local-data/`, archives, and real
   company data accessed: no
@@ -45,7 +48,7 @@ Immutable images:
 - MinIO: `sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0`
 - MinIO client: `sha256:fb8f773eac8ef9d6da0486d5dec2f42f219358bcb8de579d1623d518c9ebd4cc`
 
-Candidate source hashes embedded in the built images matched the repository:
+Embedded candidate source hashes matched the repository:
 
 - `apps/api/src/database.py`: `4189a4863c84736d2638c5462ac41909795c54ea544cbe65eab67adc0203d005`
 - `apps/api/src/domain.py`: `3159f4860a760375724f16017cb8fc65ebd09fe53f09be9ded12841195aa36d5`
@@ -53,188 +56,269 @@ Candidate source hashes embedded in the built images matched the repository:
 - `apps/api/src/storage.py`: `b40b13f3a217d04e1216ddfdc517af028e3f97c8ba653863e594e110f9e8f087`
 - `apps/ocr-worker/src/jobs/worker.py`: `c1dcef0f47596b4651de825bcb401a8f5ce6a83f183c6585251d332bb3bb3acf`
 
-## 2. P0-16 repair and regression
+## 2. P0-16 attempt-accounting result
 
-The repair uses conditional accounting in
-`PostgresRepository.mark_ocr_failed()`. A job that is still `QUEUED` failed
-before `start_ocr_run()` and is incremented there. A `RUNNING` job was already
-incremented by `start_ocr_run()` and is not incremented again. This is the
-narrowest change that counts every failed worker attempt exactly once without
-double-counting the normal path.
+The accepted repair conditionally increments in `mark_ocr_failed()` when the
+pre-update job status is `QUEUED`. A `RUNNING` job was already counted by
+`start_ocr_run()` and is not incremented again. The statement remains atomic
+under the existing locked job row.
 
-No migration was required. The existing `ocr_jobs_one_per_ingestion` constraint
-still guarantees one job per ingestion. The existing R02 column-level
-`smartcoat_ocr` grant already permits `attempt_count` along with the other OCR
-status columns; no grant was widened.
+No migration was required. `ocr_jobs_one_per_ingestion` remains sufficient, and
+the existing R02 `smartcoat_ocr` column-level UPDATE grant already includes
+`attempt_count`; no grant was widened.
 
-The new regression injects failure before `start_ocr_run()`. Against
-`a824ad1d0bb9d3b36187162c5ba1ee2c800bbfab`, it failed with expected `1`, actual
-`0`, and the production SQL lacked conditional accounting. After `8d1531f`, the
-focused recovery suite passed all `12` tests. It proves counts `1`, `2`, and `3`
-and rejects the next retry at `OCR_MAX_ATTEMPTS=3`.
+The regression failed against `a824ad1` with expected count `1`, actual count
+`0`, and passed after the repair with 12 focused tests. The live pilot then
+observed attempts `1`, `2`, and `3` and an expected HTTP `409` rejection of the
+next retry.
 
-## 3. Reproducible fixture set and declared outcomes
+## 3. Reproducible fixtures and hashes
 
-The generator is `scripts/generate-synthetic-pilot-fixtures.py`. Generated
-binaries remain outside Git.
+The standard-library generator is
+`scripts/generate-synthetic-pilot-fixtures.py`. Generated binaries remained
+outside Git.
 
-1. `01-clean-handwritten-lab-note.png`
-   - Bytes: `20099`
-   - SHA-256: `8b160b2fd7554e53d1f5f5e340efc7c509eeff5a04efb9d5bc07cf39f2479c81`
-   - Expected: `VERIFIED` or bounded `OCR_FAILED`
-2. `02-poor-light-skewed-lab-note.png`
-   - Bytes: `26067`
-   - SHA-256: `7cfc784b0ec868d3022e0ec48ef79475b6b92deaf0e4954ddbfb6e18f8f7a2f9`
-   - Expected: `VERIFIED` or bounded `OCR_FAILED`
-3. `03-rotated-90-scan.png`
-   - Bytes: `30906`
-   - SHA-256: `6ace82fca186fce857ceeaec9f307c75f9865fa2fa215c99a3be1dd39a2a1d2b`
-   - Expected: `VERIFIED` or bounded `OCR_FAILED`
-4. `04-multipage-technical-report.pdf`
-   - Bytes: `1282`
-   - SHA-256: `506a7985b9a7ae4c9b79bb3900f564ab514b953266f1c2e5a7912c93a94dab96`
-   - Expected: `VERIFIED` or bounded `OCR_FAILED`
-5. `05-measurement-sheet.xlsx`
-   - Bytes: `1632`
-   - SHA-256: `3bb6da33c0bcf0a598b8b2353fb157711f93d801c9e83ab1457aafbd020ff1f4`
-   - Expected: `VERIFIED` or bounded `OCR_FAILED`
-6. `06-photo-of-screen.png`
-   - Bytes: `7872`
-   - SHA-256: `6cf7cc4b64d8edb5c279c23ebee29919a93483262d00c3da6f977e9749449067`
-   - Expected: `VERIFIED` or bounded `OCR_FAILED`
-7. `07-byte-identical-duplicate.png`
-   - Bytes: `20099`
-   - SHA-256: `8b160b2fd7554e53d1f5f5e340efc7c509eeff5a04efb9d5bc07cf39f2479c81`
-   - Expected: a second independently version-addressed, retention-protected,
-     Legal-Hold-protected Bronze pair linked to fixture 1 by
-     `duplicate_of_ingestion_id`; four stored objects across the two events;
-     distinct `pair_identity_sha256` values despite equal payload hashes
-8. `08-over-50mb.jpg`
-   - Bytes: `52428801`
-   - SHA-256: `d824d08a7160201a7318d1da8cef127849bf91a92f0eea5cce384bae760a25b7`
-   - Expected: `FILE_TOO_LARGE`, audited, no Bronze object
-9. `09-unsupported.txt`
-   - Bytes: `37`
-   - SHA-256: `b3245727f2f1a5af5e8a2fded09d9042557d0d480c7669631ffdbb4828598b98`
-   - Expected: `UNSUPPORTED_TYPE`, audited, no Bronze object
-10. `10-corrupt-valid-extension.pdf`
-    - Bytes: `61`
-    - SHA-256: `d5dc50276b1920beb87d39063a1f76518b3eec12651942d089fa260319615516`
-    - Expected: `CORRUPT_FILE` or bounded `OCR_FAILED`
+1. `01-clean-handwritten-lab-note.png` — `20099` bytes —
+   `8b160b2fd7554e53d1f5f5e340efc7c509eeff5a04efb9d5bc07cf39f2479c81`
+2. `02-poor-light-skewed-lab-note.png` — `26067` bytes —
+   `7cfc784b0ec868d3022e0ec48ef79475b6b92deaf0e4954ddbfb6e18f8f7a2f9`
+3. `03-rotated-90-scan.png` — `30906` bytes —
+   `6ace82fca186fce857ceeaec9f307c75f9865fa2fa215c99a3be1dd39a2a1d2b`
+4. `04-multipage-technical-report.pdf` — `1282` bytes —
+   `506a7985b9a7ae4c9b79bb3900f564ab514b953266f1c2e5a7912c93a94dab96`
+5. `05-measurement-sheet.xlsx` — `1632` bytes —
+   `3bb6da33c0bcf0a598b8b2353fb157711f93d801c9e83ab1457aafbd020ff1f4`
+6. `06-photo-of-screen.png` — `7872` bytes —
+   `6cf7cc4b64d8edb5c279c23ebee29919a93483262d00c3da6f977e9749449067`
+7. `07-byte-identical-duplicate.png` — `20099` bytes —
+   `8b160b2fd7554e53d1f5f5e340efc7c509eeff5a04efb9d5bc07cf39f2479c81`
+8. `08-over-50mb.jpg` — `52428801` bytes —
+   `d824d08a7160201a7318d1da8cef127849bf91a92f0eea5cce384bae760a25b7`
+9. `09-unsupported.txt` — `37` bytes —
+   `b3245727f2f1a5af5e8a2fded09d9042557d0d480c7669631ffdbb4828598b98`
+10. `10-corrupt-valid-extension.pdf` — `61` bytes —
+    `d5dc50276b1920beb87d39063a1f76518b3eec12651942d089fa260319615516`
 
-## 4. Expected versus actual outcomes
+## 4. Expected versus actual outcome
 
-- Fixture 1: `PARTIAL_PASS`
-  - Upload HTTP status: `201`
-  - Ingestion: `01a06760-a165-7d14-9963-3f87e4c161cf`
-  - OCR job: `8de951ea-f8e6-4d31-8c32-e2d9c4c2a918`
-  - OCR attempt count: `1`
-  - Reached: `SILVER_DRAFT_READY`
-  - Human review was not run before the fail-closed stop.
-- Fixture 2: `PRODUCT_PATH_PASS_HARNESS_CLASSIFICATION_FAIL`
-  - Upload HTTP status: `201`
-  - Ingestion: `01a06761-41aa-7279-b32f-57d10a65d0e9`
-  - OCR job: `61b4df29-ff2d-42e0-81e6-5b4fbeee44b3`
-  - Three intentionally injected pre-run exact-version retrieval failures were
-    counted.
-  - Retry log records exposed attempt counts `1` and `2`.
-  - The next request was rejected by the API at count `3` with HTTP `409`.
-  - The temporary client emitted no result for that expected HTTP error and
-    stopped the harness.
-- Fixtures 3–10: `NOT_RUN_AFTER_FAIL_CLOSED_STOP`
+- Fixture 1: expected `VERIFIED` or bounded `OCR_FAILED`; actual `VERIFIED` in
+  one OCR attempt and one explicit human review.
+- Fixture 2: expected `VERIFIED` or bounded `OCR_FAILED`; actual `OCR_FAILED`
+  after exactly three deliberately injected pre-run retrieval failures. Further
+  retry returned HTTP `409` with `EXPECTED_REJECTION`.
+- Fixture 3: expected `VERIFIED` or bounded `OCR_FAILED`; actual `VERIFIED` in
+  one OCR attempt and one explicit human review.
+- Fixture 4: expected `VERIFIED` or bounded `OCR_FAILED`; actual `VERIFIED` in
+  one extraction attempt and one explicit human review. The PDF path executed.
+- Fixture 5: expected `VERIFIED` or bounded `OCR_FAILED`; actual `OCR_FAILED`
+  after exactly three attempts. Further retry returned HTTP `409`. The Excel
+  extraction path executed and failed honestly without fabricated Silver fact.
+- Fixture 6: expected `VERIFIED` or bounded `OCR_FAILED`; actual `VERIFIED`.
+  Two concurrent reviews produced exactly one HTTP `200` decision and one
+  expected HTTP `422` conflict.
+- Fixture 7: expected a second, independently protected provenance pair linked
+  to fixture 1; actual `VERIFIED`, linked through
+  `duplicate_of_ingestion_id=01a0695f-22b5-7d28-a9ed-12e5c9c17116`.
+- Fixture 8: expected size rejection; actual audited `FILE_TOO_LARGE`, HTTP
+  `422`, no Bronze growth.
+- Fixture 9: expected type rejection; actual audited `UNSUPPORTED_TYPE`, HTTP
+  `422`, no Bronze growth.
+- Fixture 10: expected validation rejection or bounded `OCR_FAILED`; actual
+  audited `CORRUPT_FILE`, HTTP `422`, no Bronze growth.
 
-Because the stop preceded the protection query, this run does not claim a
-complete original-plus-manifest protection table. The upload responses retained
-the original object keys, exact original version IDs, hashes, retention class,
-and policy, but independent storage read-back was not reached.
+An additional synthetic copy of fixture 3 exercised human review rejection and
+reached `REVIEW_REJECTED` through the application review boundary.
 
-## 5. Sanitized retry-bound evidence
+## 5. Corrected fixture-7 provenance result
 
-The retained API log contains these decisive records:
+Fixture 7 created a second original-plus-manifest pair rather than deduplicating
+away the upload event:
 
-```json
-{"actor_id":"usr_wp10_synthetic","attempt_count":1,"correlation_id":"4f7d4a56-2ad7-4029-9145-336d3b1e551d","event":"ocr.job.queued","ingestion_id":"01a06761-41aa-7279-b32f-57d10a65d0e9","level":"INFO","max_attempts":3,"ocr_job_id":"61b4df29-ff2d-42e0-81e6-5b4fbeee44b3","recovery":true,"service":"api"}
-{"actor_id":"usr_wp10_synthetic","attempt_count":2,"correlation_id":"4cea2ace-c4dc-4013-b186-4dd03dd031ef","event":"ocr.job.queued","ingestion_id":"01a06761-41aa-7279-b32f-57d10a65d0e9","level":"INFO","max_attempts":3,"ocr_job_id":"61b4df29-ff2d-42e0-81e6-5b4fbeee44b3","recovery":true,"service":"api"}
-{"actor_id":"usr_wp10_synthetic","correlation_id":"a8cbc4e1-e6c8-4972-8e1a-b9881d278941","error_type":"StateConflict","event":"upload.state_conflict.rejected","ingestion_id":"01a06761-41aa-7279-b32f-57d10a65d0e9","level":"WARNING","reason":"OCR retry limit reached (3 attempts); operator review is required","service":"api"}
-{"correlation_id":"a8cbc4e1-e6c8-4972-8e1a-b9881d278941","duration_ms":16.905,"event":"request.completed","level":"INFO","method":"POST","path":"/api/uploads/01a06761-41aa-7279-b32f-57d10a65d0e9/retry-ocr","service":"api","status_code":409}
-```
+- Payload SHA-256 equal to fixture 1: yes
+- `duplicate_of_ingestion_id` points to fixture 1: yes
+- Fixture-1 pair identity:
+  `565e01259b4d3b6d18aad5a093c8135dce1bf9f54a80cf29eb9da30b195e673b`
+- Fixture-7 pair identity:
+  `7a3b80a4d448641538009b9a1ec134fc0df4fc3a6f397c479325261f1fdcc871`
+- Pair identities distinct: yes
+- Stored objects across the two ingestion events: `4`
 
-No Bearer token, password, MinIO credential, database URL, raw Authorization
-header, raw Docker output, or raw PostgreSQL output is present in the retained
-structured evidence.
+This proves two distinct provenance events with independent protection
+obligations, not an identity collision.
 
-## 6. Fault-injection and orphan-window status
+## 6. Base-set protection evidence
 
-The seven WP10 fault scenarios were not reached after the fail-closed stop:
+For fixtures 1–7, the database returned 14 exact object records and storage
+read-back returned the same 14 exact versions:
 
-- PostgreSQL killed before Bronze commit: `NOT_RUN`
-- PostgreSQL killed after object writes and before pair commit: `NOT_RUN`
-- MinIO killed mid-ingest: `NOT_RUN`
-- Retry of an already-completed ingestion: `NOT_RUN`
-- Two concurrent reviews of one draft: `NOT_RUN`
-- OCR failure, bounded retry, and exhaustion: product boundary observed, but
-  harness outcome invalidated by the client defect
-- PostgreSQL killed after MinIO enforcement and before evidence insertion:
-  `NOT_RUN`
+- Original objects: `7`
+- Manifest objects: `7`
+- Retention class: `permanent` for all
+- Database retention mode: `COMPLIANCE` for all
+- Database retain-until value present: yes for all
+- Enforcement verification result: `SUCCESS` for all
+- Storage retention mode: `COMPLIANCE` for all
+- Storage retain-until value present: yes for all
+- Storage Legal Hold: `ON` for all
+- Exact-version SHA-256 read-back matched: yes for all
 
-The decisive orphan-window scenario was not reached. This run provides no new
-evidence for or against escalation of the orphan discovery sweep. Its ratified
-deferred status remains unchanged.
+No Bronze object was deleted, shortened, or released by any normal-runtime
+operation during the completed portion of the pilot.
 
-## 7. State transitions and lineage
+## 7. Fault-injection results
 
-Fixture 1 reached `RECEIVED → BRONZE_COMMITTED → OCR_QUEUED → OCR_RUNNING →
-SILVER_DRAFT_READY`. Fixture 2 reached `RECEIVED → BRONZE_COMMITTED →
-OCR_QUEUED`, then repeated the legal `OCR_FAILED → OCR_QUEUED` recovery edge
-until the configured bound rejected further retry. All observed edges belong to
-the accepted transition graph.
+### 7.1 PostgreSQL killed before Bronze commit — PASS
 
-The run stopped before human review and the final lineage query. It therefore
-does not claim `VERIFIED`, review rejection, duplicate lineage, or end-to-end
-lineage coverage.
+- Client observed HTTP `500`.
+- Matching upload rows after PostgreSQL recovery: `0`.
+- Result: no half-recorded ingestion and no Bronze commit.
+- Discoverable: yes.
+- Recoverable: yes; ordinary retry can create a new ingestion event.
 
-## 8. Problems encountered
+### 7.2 PostgreSQL killed after two protected writes before pair commit — PASS
 
-Two OCR image build invocations were inadvertently active concurrently while
-the execution tool was returning an asynchronous session identifier. Both
-completed with the same candidate tag; no pilot resources existed yet and no
-repository file changed. The final immutable OCR image ID was authenticated
-before the pilot.
+Before reconciliation:
 
-The live pilot then exposed the temporary client defect described in the
-decision section. This was outside repository and production code. In accordance
-with the no-iteration rule, it was not changed after the run and the pilot was
-not repeated.
+- State: `RECEIVED`
+- Pair rows: `0`
+- Bronze object rows: `0`
+- Durable orphan rows: `0`
+- Reconciliation rows: `0`
+- OCR jobs: `0`
 
-## 9. What this pilot did not prove
+The ordinary API reconciliation path rediscovered the exact versions through
+the application MinIO identity, independently re-read and protected both, and
+returned `RECONCILED`. After reconciliation:
 
-This run did not prove:
+- Pair rows: `1`
+- Bronze object rows: `2`
+- Durable orphan rows: `2`
+- Reconciliation rows: `1`
+- OCR jobs: `1`
+- State: `OCR_QUEUED`
 
-- human verification of fixture 1;
-- end-to-end outcomes for fixtures 3–10;
-- PDF and Excel extraction;
-- corrected fixture-7 duplicate linkage, four-object count, or distinct pair
-  identities;
-- validation rejection and audit behavior for fixtures 8–10;
-- review rejection or concurrent-review behavior;
-- the PostgreSQL, MinIO, orphan-window, completed-retry, or retention-evidence
-  fault scenarios;
-- final independent per-object retention and Legal Hold read-back;
-- a complete lineage query or transition trace.
+Repeated reconciliation returned `ALREADY_COMMITTED` with the same OCR job and
+identical counts. Both exact versions read back as `COMPLIANCE`, retain-until
+present, and Legal Hold `ON`.
 
-No claim of `P0-16` pilot readiness is made.
+Explicit orphan-window decision: **no invisible orphan was observed, and this
+run does not escalate the deferred discovery sweep to P1.** Exact-version
+discovery and recovery succeeded through the ordinary application boundary.
 
-## 10. Preserved evidence and cleanup
+### 7.3 MinIO killed after RECEIVED and before original write — PASS
 
-Sanitized evidence was written before Docker cleanup:
+- Persisted state: `RECEIVED`
+- Pair/object/orphan/reconciliation/job counts: all `0`
+- Reconciliation returned expected HTTP `409` with `Protected Bronze pair is
+  incomplete`; no partial record was treated as fact.
+- After MinIO recovery, the documented operator re-upload created one new
+  ingestion event with one pair, two objects, and one OCR job.
+- The failed `RECEIVED` ingestion remained discoverable.
+- Recoverable on the same ingestion: no.
+- Recoverable by explicit provenance-preserving re-upload: yes.
 
-- Evidence directory: `/private/tmp/smartcoat-wp10-evidence-3fcaebe0c6ec`
+### 7.4 Retry already-completed ingestion — FAIL
+
+- Target state before the request: `VERIFIED`.
+- Endpoint: `POST /api/uploads/{ingestion_id}/reconcile-bronze`.
+- Actual result: HTTP `409`.
+- Actual classification: `StateConflict`.
+- Actual reason: `OCR cannot be queued before a successful Bronze pair commit`.
+- Expected result: idempotent `ALREADY_COMMITTED` with the existing OCR job and
+  no additional pair, object, or job.
+
+The source path rejects before returning its documented existing-pair result.
+The disposable database was cleaned after evidence preservation, so this report
+does not substitute a post-cleanup inference for a retained after-state query.
+
+### 7.5 Concurrent reviews — product boundary observed before stop
+
+- One review returned HTTP `200` and created the verified outcome.
+- The competing review returned expected HTTP `422` with `The Silver draft
+  already has a different effective review decision`.
+- The later dedicated database count was not reached because fault 7.4 stopped
+  execution; no stronger exactly-one database claim is made here.
+
+### 7.6 Bounded OCR retry — PASS
+
+- Fixture 2: attempts `1`, `2`, `3`, then HTTP `409`.
+- Fixture 5: attempts `1`, `2`, `3`, then HTTP `409`.
+- Terminal state for both: `OCR_FAILED`.
+- Bronze evidence remained preserved.
+
+### 7.7 PostgreSQL killed after storage enforcement before evidence insert
+
+`NOT_RUN_AFTER_FAIL_CLOSED_STOP`.
+
+## 8. Observed state transitions and lineage
+
+The retained structured logs observed only accepted edges, including:
+
+- `null → RECEIVED`
+- `RECEIVED → BRONZE_COMMITTED`
+- `BRONZE_COMMITTED → OCR_QUEUED`
+- `OCR_QUEUED → OCR_RUNNING`
+- `OCR_RUNNING → SILVER_DRAFT_READY`
+- `OCR_RUNNING → OCR_FAILED`
+- `OCR_FAILED → OCR_QUEUED`
+- `SILVER_DRAFT_READY → UNDER_HUMAN_REVIEW`
+- `UNDER_HUMAN_REVIEW → VERIFIED`
+- `UNDER_HUMAN_REVIEW → REVIEW_REJECTED`
+
+The final aggregate transition and lineage queries were after the failing fault
+and were not reached. No complete-graph or final-lineage claim is made.
+
+## 9. Structured correlation evidence
+
+The protected-write orphan recovery retained one correlation chain with:
+
+- Ingestion: `01a06960-b05a-7f51-b200-eeff22d45fdd`
+- OCR job: `7e22a462-a0e9-476b-9d5f-28f21aff2ea9`
+- First reconciliation: `RECONCILED`
+- Repeated reconciliation: `ALREADY_COMMITTED`
+- Pair identity and exact original/manifest versions retained in the sanitized
+  evidence file.
+
+The completed-ingestion replay failure retained correlation ID
+`b0bae51a-1a87-4556-8247-30ef8240f94b`, the `StateConflict` classification,
+reason, request path, and HTTP `409` completion record.
+
+No Bearer token, password, MinIO credential, database URL, or raw Authorization
+header is present in the retained structured evidence.
+
+## 10. Problems encountered
+
+Before the decisive run, two evidence-instrument defects were corrected without
+changing repository product code:
+
+1. Expected `urllib.error.HTTPError` responses were not serialized because the
+   print logic was incorrectly placed in a `try/else` block.
+2. The protection query selected nonexistent `e.outcome` instead of migration
+   `0007`'s `e.enforcement_verification_result`.
+
+Both instrument changes were preserved as standalone diffs. The final run then
+stopped on `P0-16-DEFECT-02`; that product defect was not fixed.
+
+## 11. What this pilot did not prove
+
+The stopped run did not prove:
+
+- idempotent completed-ingestion reconciliation;
+- a final database count of exactly one effective concurrent-review decision;
+- fault 7.7, the retention-evidence insertion failure window;
+- the final all-object protection audit after every fault-created ingestion;
+- a final aggregate lineage result or complete transition trace;
+- OCR transcription accuracy, which was explicitly outside scope.
+
+## 12. Evidence preservation and cleanup
+
+- Evidence directory: `/private/tmp/smartcoat-wp10-evidence-c0214622d581`
 - Pre-cleanup partial evidence SHA-256:
-  `5593eaa0b0df14e6c6a7095530741ee6754f0ed3450f4d2a5901b4e996491b0a`
+  `090b62b77b5ad9810d512107f9374557c9c3f7ac405f95f23219b887efe74561`
 - Pre-cleanup manifest SHA-256:
-  `89ca72bd64d61e9764961d37d1a6ee6b8ccf399113f12e242c718c6807252cec`
+  `4cb43068bc7d41dbe0a057054abde9bf0572e9d5105ac84dc0d555f72067fbf0`
 - Final sanitized evidence SHA-256:
-  `920bf7ec06be557cb85abe2573a59e55eb0ff05500beeb5eaef6fdee1904e0e3`
+  `120eb887c8e0fd79b90c2c380357c95b2dab53b876d99395db926eac2002682d`
 
 Docker inventory before and after cleanup:
 
@@ -245,28 +329,25 @@ Docker inventory before and after cleanup:
   `6a8679177eb1436031a46b8e6b948abd9f4e977373ac48e0cfa9b42287b81de6`
 - Owned resources remaining: zero containers, zero networks, zero volumes
 
-No normal-runtime delete, shortening, or Legal Hold release was invoked. The
-owned disposable MinIO volume was removed only by mandatory finalization after
-evidence preservation.
-
-## 11. Verification results retained before the pilot
+## 13. Retained regression and CI evidence
 
 - Solo-review focused acceptance: `15` passed
-- P0-16 focused OCR recovery suite before fix at `a824ad1`: failed as expected
-  with attempt count `0` instead of `1`
-- P0-16 focused OCR recovery suite after fix: `12` passed
-- API suite after fix: `85` passed
-- OCR suite after fix: `12` passed
-- PostgreSQL offline suite after fix: `128` passed, `17` external checks skipped
-- Python compilation of affected files: exit `0`
+- P0-16 focused suite before fix at `a824ad1`: failed as expected
+- P0-16 focused suite after fix: `12` passed
+- API suite: `85` passed
+- OCR suite: `12` passed
+- PostgreSQL offline suite: `128` passed, `17` external checks skipped
+- Python compilation: exit `0`
 - Compose render: exit `0`
 - Repository scan: `AT-14 passed`
-- `git diff --check`: exit `0`
-- Ruff was not installed in the local host environment and was not run
+- CI for candidate `45a299a`: success, run `33805174882`
+- Offline repaired-client classification check: pass for expected HTTP `400`,
+  `409`, `413`, `415`, and `422`; unexpected HTTP `500`; and transport failure
 
-No baseline command was rerun after the live pilot stopped.
+No test was weakened. No migration, production source, policy, credential,
+state, or transition edge was changed by the pilot.
 
-## 12. Protected hashes
+## 14. Protected hashes
 
 - `0001`: `7f34c9aba3819a49a5bb6c83f75bceaf436009d36c1c62eb46d0ddfa425529e5`
 - `0002`: `1f3f3b3faa3340c503bad0e844b08af6af5312546a35c5d2ab399fd6e105dffe`
@@ -283,15 +364,19 @@ No baseline command was rerun after the live pilot stopped.
 - Contract-freeze matrix:
   `cece377662dcb5224fa70226e4200f14017745615a6b31024c792cdc9d33de12`
 
-## 13. Gate status
+## 15. Gate status
 
-- WP11 prerequisite: `COMPLETE`
-- `P0-16-DEFECT-01`: `FIXED_AND_REGRESSION_VERIFIED`
-- WP10 live pilot: `BLOCKED_VERIFICATION_HARNESS`
-- Fixture 1: `IN_PROGRESS_AT_SILVER_DRAFT_READY_WHEN_DISPOSABLE_RUN_ENDED`
-- Fixture 2: `BOUNDED_OCR_FAILURE_PRODUCT_PATH_VERIFIED`
-- Fixtures 3–10: `NOT_STARTED_IN_RESUMED_RUN`
-- Orphan-window decision: `UNRESOLVED`; existing deferral unchanged
+- `P0-16-DEFECT-01`: `CLOSED`
+- WP10 harness repair: `COMPLETE`
+- Fixtures 1–10: `EXECUTED`
+- Base Bronze exact-version protection: `PASS`
+- Corrected fixture-7 provenance: `PASS`
+- Faults 7.1–7.3: `PASS`
+- Fault 7.4: `FAIL_PRODUCT_CONTRACT`
+- Faults 7.5–7.6: `OBSERVED_BEFORE_STOP`
+- Fault 7.7: `NOT_RUN`
+- `P0-16-DEFECT-02`: `OPEN`
+- WP10: `BLOCKED`
 - M0-R05: `NOT_STARTED`
 - Platform: `BLOCKED`
 - Real company data: `PROHIBITED`
