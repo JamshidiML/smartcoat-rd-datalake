@@ -331,7 +331,7 @@ POSITIVE_PATH_REQUIREMENTS = (
         "smartcoat_ocr", "ocr_worker.failure", "mark_ocr_failed",
         ("uploads", "SELECT"), ("uploads", "UPDATE", ("state",)),
         ("ocr_jobs", "SELECT"),
-        ("ocr_jobs", "UPDATE", ("status", "completed_at_utc", "error_reason")),
+        ("ocr_jobs", "UPDATE", ("status", "completed_at_utc", "attempt_count", "error_reason")),
         ("ocr_runs", "UPDATE", ("status", "completed_at_utc")),
         ("bronze_pairs", "SELECT"),
         ("bronze_objects", "SELECT", ("bronze_object_id", "object_version_id")),

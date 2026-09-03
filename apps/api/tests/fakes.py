@@ -322,6 +322,9 @@ class MemoryRepository:
             value for value in self.jobs.values()
             if value["ingestion_id"] == ingestion_id
         )
+        previous_status = job["status"]
+        if previous_status == "QUEUED":
+            job["attempt_count"] += 1
         original = next(
             item for item in self.objects
             if item["ingestion_id"] == ingestion_id and item["kind"] == "ORIGINAL"
@@ -345,7 +348,7 @@ class MemoryRepository:
             "original_object_version_id": original["version_id"],
         }
         self._audit(
-            job["ocr_job_id"], "OCR_JOB_FAILED", "RUNNING", "FAILED",
+            job["ocr_job_id"], "OCR_JOB_FAILED", previous_status, "FAILED",
             "ocr-worker", details,
         )
         self._audit(

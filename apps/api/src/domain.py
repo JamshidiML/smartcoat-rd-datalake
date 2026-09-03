@@ -32,6 +32,17 @@ REJECTION_DECISIONS = {
     "REQUIRES_REUPLOAD",
 }
 DEFAULT_OCR_MAX_ATTEMPTS = 3
+DEFAULT_ALLOW_PHASE_1_SOLO_SELF_REVIEW = False
+
+
+def configured_solo_self_review(
+    environment: dict[str, str] | None = None,
+) -> bool:
+    """Allow the ratified Phase-1 exception only after an explicit true value."""
+
+    source = os.environ if environment is None else environment
+    configured = source.get("ALLOW_PHASE_1_SOLO_SELF_REVIEW", "false")
+    return configured.strip().lower() == "true"
 
 
 def configured_ocr_max_attempts(

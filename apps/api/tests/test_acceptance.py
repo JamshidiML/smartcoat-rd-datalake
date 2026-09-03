@@ -20,6 +20,7 @@ from domain import (  # noqa: E402
     ReviewValidationError,
     SOLO_EXCEPTION_REASON,
     StateConflict,
+    configured_solo_self_review,
 )
 from fakes import MemoryRepository, MemoryRetentionEnforcer, MemoryStorage  # noqa: E402
 from validation import UploadValidationError  # noqa: E402
@@ -179,6 +180,21 @@ class AcceptanceTests(unittest.TestCase):
             ReviewService(second_repository, False).review(
                 draft["silver_draft_id"], ACTOR, "text", "APPROVED_NO_CHANGES", "", True
             )
+
+    def test_solo_self_review_configuration_fails_closed_on_malformed_values(self) -> None:
+        self.assertFalse(configured_solo_self_review({}))
+        for malformed in ("yes", "1", "enabled", "malformed", ""):
+            with self.subTest(malformed=malformed):
+                self.assertFalse(
+                    configured_solo_self_review(
+                        {"ALLOW_PHASE_1_SOLO_SELF_REVIEW": malformed}
+                    )
+                )
+        self.assertTrue(
+            configured_solo_self_review(
+                {"ALLOW_PHASE_1_SOLO_SELF_REVIEW": "true"}
+            )
+        )
 
     def test_at_11_edit_creates_new_reviewed_revision(self) -> None:
         result = self.upload()
