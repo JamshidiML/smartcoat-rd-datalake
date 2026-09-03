@@ -4,47 +4,79 @@
 
 **Result: `FAIL_SYNTHETIC_END_TO_END_PILOT`**
 
-The pilot stopped at the first product-contract failure, as required. The real
-OCR worker can fail before `start_ocr_run()` increments `ocr_jobs.attempt_count`.
-Those failures enter `OCR_FAILED`, but the counter remains zero, so the bounded
-operator-retry limit is never reached. A fourth operator retry was accepted with
-HTTP 200 and `attempt_count: 0` after three observed worker failures.
+The resumed pilot stopped at its first acceptance-harness failure, as required.
+It did not reveal a new product-contract defect. The production-bound API
+recorded three pre-run OCR failures for fixture 2 and rejected the next retry
+with HTTP `409` and the reason `OCR retry limit reached (3 attempts); operator
+review is required`. This is direct evidence that `P0-16-DEFECT-01` is fixed.
 
-Defect identifier: `P0-16-DEFECT-01`.
+The temporary HTTP evidence client mishandled expected non-2xx responses. Its
+`urllib.error.HTTPError` handler populated a result, but the serialization and
+print logic was in the `try` statement's `else` block. Python does not execute
+that block after a handled exception. The client therefore returned no stdout
+for the expected `409`, and the harness classified it as
+`NO_CLIENT_RESULT`. The API's sanitized structured log retained the actual
+`409` outcome.
 
-No production code, governance document, migration, state, transition edge,
-OCR engine, or preprocessing configuration was changed. The remaining fixture
-and fault scenarios were not run after this failure.
+This is `FAIL_VERIFICATION_HARNESS`, not `FAIL_PRODUCT_CONTRACT`. WP10 says to
+stop and report after a pilot failure, so the harness was not repaired and the
+live pilot was not rerun. Fixtures 3–10 and the seven fault scenarios remain
+unexecuted in this run.
 
-## 1. Execution identity
+## 1. Execution identity and checkpoints
 
 - Date: `2026-09-03`
-- Starting branch: `integration/m0-stage1-parallel-20260827`
-- Starting commit: `a824ad1d0bb9d3b36187162c5ba1ee2c800bbfab`
+- Integration base: `a824ad1d0bb9d3b36187162c5ba1ee2c800bbfab`
 - Execution branch: `agent/wp10-synthetic-pilot`
-- Disposable project: `bronzepair-ac37cadd2ff5`
+- Fixture/report checkpoint: `f363eae`
+- Solo-review governance prerequisite: `3a343a3`
+- P0-16 repair checkpoint: `8d1531f3f055d1eb3af6babff99bacc2be6ee82a`
+- Disposable project: `bronzepair-a534a9d2ae19`
 - Synthetic data only: yes
-- Existing containers, volumes, networks, `./.local-data/`, and archives used:
-  no
+- Existing containers, volumes, networks, `./.local-data/`, archives, and real
+  company data accessed: no
 
 Immutable images:
 
-- API: `sha256:cd276d9b3b8c3c083bb037cc88be592306f531337b0268be85cd8e29a14a8d92`
-- OCR worker: `sha256:ad9d479532cfb309c38023b7a305176332a360c72af0a760b120f3511f378d46`
+- API: `sha256:fc1aee8b138354a98f30f064533a082bb73dfd72383b653f6c17fef906d051ec`
+- OCR worker: `sha256:fd8dfe1cb15204b3b0f956b491900ba6348e9ba94ccd52c8f59e1d0a69e54545`
 - Legal Hold mediator: `sha256:bbb170b5a8eed05a179db672e7528b222e8c93c433ffdf79605fd9e8045d57ef`
 - PostgreSQL: `sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94`
 - MinIO: `sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0`
 - MinIO client: `sha256:fb8f773eac8ef9d6da0486d5dec2f42f219358bcb8de579d1623d518c9ebd4cc`
 
-The API image contained byte-identical copies of the candidate `database.py`,
-`domain.py`, `storage.py`, and `main.py`. The OCR image contained byte-identical
-copies of `database.py`, `domain.py`, `storage.py`, and `jobs/worker.py`.
+Candidate source hashes embedded in the built images matched the repository:
 
-## 2. Reproducible fixture set
+- `apps/api/src/database.py`: `4189a4863c84736d2638c5462ac41909795c54ea544cbe65eab67adc0203d005`
+- `apps/api/src/domain.py`: `3159f4860a760375724f16017cb8fc65ebd09fe53f09be9ded12841195aa36d5`
+- `apps/api/src/main.py`: `0678fb4dc5814d92e46ced6d2984e18acf17da86d10355e2887654d0e72e280c`
+- `apps/api/src/storage.py`: `b40b13f3a217d04e1216ddfdc517af028e3f97c8ba653863e594e110f9e8f087`
+- `apps/ocr-worker/src/jobs/worker.py`: `c1dcef0f47596b4651de825bcb401a8f5ce6a83f183c6585251d332bb3bb3acf`
 
-The generator is `scripts/generate-synthetic-pilot-fixtures.py`. It uses only
-the Python standard library. Two independent generations produced identical
-file and manifest hashes. Generated binaries remain outside Git.
+## 2. P0-16 repair and regression
+
+The repair uses conditional accounting in
+`PostgresRepository.mark_ocr_failed()`. A job that is still `QUEUED` failed
+before `start_ocr_run()` and is incremented there. A `RUNNING` job was already
+incremented by `start_ocr_run()` and is not incremented again. This is the
+narrowest change that counts every failed worker attempt exactly once without
+double-counting the normal path.
+
+No migration was required. The existing `ocr_jobs_one_per_ingestion` constraint
+still guarantees one job per ingestion. The existing R02 column-level
+`smartcoat_ocr` grant already permits `attempt_count` along with the other OCR
+status columns; no grant was widened.
+
+The new regression injects failure before `start_ocr_run()`. Against
+`a824ad1d0bb9d3b36187162c5ba1ee2c800bbfab`, it failed with expected `1`, actual
+`0`, and the production SQL lacked conditional accounting. After `8d1531f`, the
+focused recovery suite passed all `12` tests. It proves counts `1`, `2`, and `3`
+and rejects the next retry at `OCR_MAX_ATTEMPTS=3`.
+
+## 3. Reproducible fixture set and declared outcomes
+
+The generator is `scripts/generate-synthetic-pilot-fixtures.py`. Generated
+binaries remain outside Git.
 
 1. `01-clean-handwritten-lab-note.png`
    - Bytes: `20099`
@@ -73,8 +105,10 @@ file and manifest hashes. Generated binaries remain outside Git.
 7. `07-byte-identical-duplicate.png`
    - Bytes: `20099`
    - SHA-256: `8b160b2fd7554e53d1f5f5e340efc7c509eeff5a04efb9d5bc07cf39f2479c81`
-   - Expected: a distinct, independently protected Bronze pair linked to
-     fixture 1 through `duplicate_of_ingestion_id`
+   - Expected: a second independently version-addressed, retention-protected,
+     Legal-Hold-protected Bronze pair linked to fixture 1 by
+     `duplicate_of_ingestion_id`; four stored objects across the two events;
+     distinct `pair_identity_sha256` values despite equal payload hashes
 8. `08-over-50mb.jpg`
    - Bytes: `52428801`
    - SHA-256: `d824d08a7160201a7318d1da8cef127849bf91a92f0eea5cce384bae760a25b7`
@@ -86,214 +120,153 @@ file and manifest hashes. Generated binaries remain outside Git.
 10. `10-corrupt-valid-extension.pdf`
     - Bytes: `61`
     - SHA-256: `d5dc50276b1920beb87d39063a1f76518b3eec12651942d089fa260319615516`
-    - Expected: `CORRUPT_FILE` validation rejection or bounded `OCR_FAILED`
+    - Expected: `CORRUPT_FILE` or bounded `OCR_FAILED`
 
-## 3. Expected versus actual outcome
+## 4. Expected versus actual outcomes
 
-- Fixture 1: `NOT_RUN_AFTER_FAIL_CLOSED_STOP`
-- Fixture 2: `FAIL`
+- Fixture 1: `PARTIAL_PASS`
   - Upload HTTP status: `201`
-  - Ingestion: `01a06702-b29d-7ccf-83e9-a39c37c0006f`
-  - OCR job: `6a66f672-fa8f-4f4d-a744-02e1c4b2458c`
-  - Upload progressed through `RECEIVED`, `BRONZE_COMMITTED`, and
-    `OCR_QUEUED`.
-  - The worker was intentionally given an invalid synthetic MinIO identity so
-    exact-version source retrieval failed through the real worker exception
-    boundary.
-  - Three worker failures were observed as `OCR_FAILED`; the first two were
-    returned to `OCR_QUEUED` by the authenticated operator endpoint.
-  - After the third failure, the expected fourth call was an HTTP 409 retry-limit
-    rejection. Actual result: HTTP 200, `status: QUEUED`, `max_attempts: 3`,
-    `attempt_count: 0`.
+  - Ingestion: `01a06760-a165-7d14-9963-3f87e4c161cf`
+  - OCR job: `8de951ea-f8e6-4d31-8c32-e2d9c4c2a918`
+  - OCR attempt count: `1`
+  - Reached: `SILVER_DRAFT_READY`
+  - Human review was not run before the fail-closed stop.
+- Fixture 2: `PRODUCT_PATH_PASS_HARNESS_CLASSIFICATION_FAIL`
+  - Upload HTTP status: `201`
+  - Ingestion: `01a06761-41aa-7279-b32f-57d10a65d0e9`
+  - OCR job: `61b4df29-ff2d-42e0-81e6-5b4fbeee44b3`
+  - Three intentionally injected pre-run exact-version retrieval failures were
+    counted.
+  - Retry log records exposed attempt counts `1` and `2`.
+  - The next request was rejected by the API at count `3` with HTTP `409`.
+  - The temporary client emitted no result for that expected HTTP error and
+    stopped the harness.
 - Fixtures 3–10: `NOT_RUN_AFTER_FAIL_CLOSED_STOP`
 
-## 4. Retained Bronze protection evidence
+Because the stop preceded the protection query, this run does not claim a
+complete original-plus-manifest protection table. The upload responses retained
+the original object keys, exact original version IDs, hashes, retention class,
+and policy, but independent storage read-back was not reached.
 
-The fixture-2 upload response retained:
+## 5. Sanitized retry-bound evidence
 
-- Original bucket: `sc-rd-bronze-originals`
-- Original key:
-  `rd/2026/09/01a06702-b29d-7ccf-83e9-a39c37c0006f/original/02-poor-light-skewed-lab-note.png`
-- Exact original version:
-  `312dd697-3592-4872-8dc8-d68903555c48`
-- Original SHA-256:
-  `7cfc784b0ec868d3022e0ec48ef79475b6b92deaf0e4954ddbfb6e18f8f7a2f9`
-- Retention class: `permanent`
-- Retention policy: `smartcoat_retention_2026_08_v1`
-
-The upload reached `BRONZE_COMMITTED`, which the database transition guard
-requires to have a committed pair, before it reached `OCR_QUEUED`. However, the
-temporary harness stopped before it copied the manifest version, pair identity,
-enforcement row, retain-until value, and independent storage Legal Hold
-read-back into retained evidence. Those values are therefore **not claimed** by
-this report. The disposable database and MinIO volume were then cleaned.
-
-## 5. Product defect evidence
-
-`apps/ocr-worker/src/jobs/worker.py` performs these operations in order:
-
-1. `claim_next_job()` selects a queued job.
-2. `process_job()` reads the exact source version from MinIO.
-3. Only after that read succeeds does the domain service call
-   `start_ocr_run()`.
-
-`apps/api/src/database.py::claim_next_job()` only selects the job. It does not
-claim it by changing its status or increment the attempt counter.
-`PostgresRepository.start_ocr_run()` increments `attempt_count`, but that method
-is downstream of the exact-version MinIO read. The worker catches a retrieval
-failure and calls `mark_ocr_failed()`, which records the unchanged zero counter.
-`retry_failed_ocr()` consequently evaluates `0 >= 3` as false forever.
-
-The existing unit test uses `MemoryRepository` and explicitly calls
-`OCRDomainService.start()` before each injected failure. That increments the
-fake counter and proves only post-start failures. It does not cover the real
-worker's pre-start source-read failure boundary.
-
-This is a product defect, not an OCR-quality failure and not an evidence-harness
-failure. A MinIO permission error, exact-version retrieval error, or temporary
-storage outage can therefore create unlimited operator retries despite the
-configured bound.
-
-## 6. Fault-injection status
-
-- OCR failure, bounded retry, and exhaustion: `FAIL`
-  - Resulting state was discoverable through the upload and OCR job.
-  - Bronze evidence was not mutated by retries.
-  - The configured retry bound was not enforced.
-- PostgreSQL kill before Bronze commit: `NOT_RUN_AFTER_FAIL_CLOSED_STOP`
-- Kill after successful object writes and before database pair commit:
-  `NOT_RUN_AFTER_FAIL_CLOSED_STOP`
-- MinIO kill mid-ingest: `NOT_RUN_AFTER_FAIL_CLOSED_STOP`
-- Retry completed ingestion: `NOT_RUN_AFTER_FAIL_CLOSED_STOP`
-- Concurrent review: `NOT_RUN_AFTER_FAIL_CLOSED_STOP`
-- Kill after MinIO retention and before enforcement-evidence insertion:
-  `NOT_RUN_AFTER_FAIL_CLOSED_STOP`
-
-## 7. Orphan-window decision
-
-The decisive orphan-window scenario was not reached because the pilot stopped
-at `P0-16-DEFECT-01`. This run provides no new evidence for or against an orphan
-discovery sweep. The previously ratified deferred status remains unchanged; the
-sweep is neither implemented nor escalated by this incomplete run.
-
-## 8. State transitions observed
-
-The retained API records show:
-
-- `null → RECEIVED`
-- `RECEIVED → BRONZE_COMMITTED`
-- `BRONZE_COMMITTED → OCR_QUEUED`
-- `OCR_FAILED → OCR_QUEUED`, repeated for the accepted retry calls
-
-Every observed transition is in the accepted 11-edge graph. The complete
-transition set was not exercised because the pilot stopped early.
-
-## 9. Structured correlation evidence
-
-The upload correlation ID and OCR job ID were both
-`6a66f672-fa8f-4f4d-a744-02e1c4b2458c`. Retained structured events include:
+The retained API log contains these decisive records:
 
 ```json
-{"actor_id":"usr_wp10_synthetic","correlation_id":"6a66f672-fa8f-4f4d-a744-02e1c4b2458c","event":"state.transition","ingestion_id":"01a06702-b29d-7ccf-83e9-a39c37c0006f","level":"INFO","service":"api","state_from":null,"state_to":"RECEIVED"}
-{"actor_id":"system","correlation_id":"6a66f672-fa8f-4f4d-a744-02e1c4b2458c","event":"state.transition","ingestion_id":"01a06702-b29d-7ccf-83e9-a39c37c0006f","level":"INFO","service":"api","state_from":"RECEIVED","state_to":"BRONZE_COMMITTED"}
-{"correlation_id":"6a66f672-fa8f-4f4d-a744-02e1c4b2458c","event":"ocr.job.queued","ingestion_id":"01a06702-b29d-7ccf-83e9-a39c37c0006f","level":"INFO","ocr_job_id":"6a66f672-fa8f-4f4d-a744-02e1c4b2458c","service":"api"}
-{"actor_id":"usr_wp10_synthetic","attempt_count":0,"event":"ocr.job.queued","ingestion_id":"01a06702-b29d-7ccf-83e9-a39c37c0006f","level":"INFO","max_attempts":3,"ocr_job_id":"6a66f672-fa8f-4f4d-a744-02e1c4b2458c","recovery":true,"service":"api"}
+{"actor_id":"usr_wp10_synthetic","attempt_count":1,"correlation_id":"4f7d4a56-2ad7-4029-9145-336d3b1e551d","event":"ocr.job.queued","ingestion_id":"01a06761-41aa-7279-b32f-57d10a65d0e9","level":"INFO","max_attempts":3,"ocr_job_id":"61b4df29-ff2d-42e0-81e6-5b4fbeee44b3","recovery":true,"service":"api"}
+{"actor_id":"usr_wp10_synthetic","attempt_count":2,"correlation_id":"4cea2ace-c4dc-4013-b186-4dd03dd031ef","event":"ocr.job.queued","ingestion_id":"01a06761-41aa-7279-b32f-57d10a65d0e9","level":"INFO","max_attempts":3,"ocr_job_id":"61b4df29-ff2d-42e0-81e6-5b4fbeee44b3","recovery":true,"service":"api"}
+{"actor_id":"usr_wp10_synthetic","correlation_id":"a8cbc4e1-e6c8-4972-8e1a-b9881d278941","error_type":"StateConflict","event":"upload.state_conflict.rejected","ingestion_id":"01a06761-41aa-7279-b32f-57d10a65d0e9","level":"WARNING","reason":"OCR retry limit reached (3 attempts); operator review is required","service":"api"}
+{"correlation_id":"a8cbc4e1-e6c8-4972-8e1a-b9881d278941","duration_ms":16.905,"event":"request.completed","level":"INFO","method":"POST","path":"/api/uploads/01a06761-41aa-7279-b32f-57d10a65d0e9/retry-ocr","service":"api","status_code":409}
 ```
 
-Thirty-six sanitized API records were retained. No Bearer token, database URL,
-password, MinIO credential, or raw Authorization header is present in this
-report.
+No Bearer token, password, MinIO credential, database URL, raw Authorization
+header, raw Docker output, or raw PostgreSQL output is present in the retained
+structured evidence.
 
-## 10. Problems encountered
+## 6. Fault-injection and orphan-window status
 
-Before the actual pilot, a disposable harness-validation attempt falsely treated
-the synthetic user ID and display name as secret material. It stopped before a
-fixture upload and restored the exact Docker inventory. The temporary detector
-was narrowed to actual generated secrets. This was a harness issue and did not
-exercise or alter product behavior.
+The seven WP10 fault scenarios were not reached after the fail-closed stop:
 
-The subsequent actual pilot encountered `P0-16-DEFECT-01` and stopped without a
-second product attempt. The defect was not fixed or bypassed.
+- PostgreSQL killed before Bronze commit: `NOT_RUN`
+- PostgreSQL killed after object writes and before pair commit: `NOT_RUN`
+- MinIO killed mid-ingest: `NOT_RUN`
+- Retry of an already-completed ingestion: `NOT_RUN`
+- Two concurrent reviews of one draft: `NOT_RUN`
+- OCR failure, bounded retry, and exhaustion: product boundary observed, but
+  harness outcome invalidated by the client defect
+- PostgreSQL killed after MinIO enforcement and before evidence insertion:
+  `NOT_RUN`
 
-## 11. What this pilot did not prove
+The decisive orphan-window scenario was not reached. This run provides no new
+evidence for or against escalation of the orphan discovery sweep. Its ratified
+deferred status remains unchanged.
 
-Because the fail-closed stop occurred during fixture 2, this run did not prove:
+## 7. State transitions and lineage
 
-- end-to-end OCR and human verification for fixtures 1 and 3–7;
-- PDF or Excel extraction;
-- duplicate provenance linkage and distinct pair identities;
-- size, unsupported-type, or corrupt-file rejection;
+Fixture 1 reached `RECEIVED → BRONZE_COMMITTED → OCR_QUEUED → OCR_RUNNING →
+SILVER_DRAFT_READY`. Fixture 2 reached `RECEIVED → BRONZE_COMMITTED →
+OCR_QUEUED`, then repeated the legal `OCR_FAILED → OCR_QUEUED` recovery edge
+until the configured bound rejected further retry. All observed edges belong to
+the accepted transition graph.
+
+The run stopped before human review and the final lineage query. It therefore
+does not claim `VERIFIED`, review rejection, duplicate lineage, or end-to-end
+lineage coverage.
+
+## 8. Problems encountered
+
+Two OCR image build invocations were inadvertently active concurrently while
+the execution tool was returning an asynchronous session identifier. Both
+completed with the same candidate tag; no pilot resources existed yet and no
+repository file changed. The final immutable OCR image ID was authenticated
+before the pilot.
+
+The live pilot then exposed the temporary client defect described in the
+decision section. This was outside repository and production code. In accordance
+with the no-iteration rule, it was not changed after the run and the pilot was
+not repeated.
+
+## 9. What this pilot did not prove
+
+This run did not prove:
+
+- human verification of fixture 1;
+- end-to-end outcomes for fixtures 3–10;
+- PDF and Excel extraction;
+- corrected fixture-7 duplicate linkage, four-object count, or distinct pair
+  identities;
+- validation rejection and audit behavior for fixtures 8–10;
 - review rejection or concurrent-review behavior;
-- the PostgreSQL, MinIO, pair-commit, retention-evidence, or completed-retry
+- the PostgreSQL, MinIO, orphan-window, completed-retry, or retention-evidence
   fault scenarios;
-- the decisive orphan-window outcome;
-- independent per-object retention and Legal Hold read-back for the pilot set;
-- an end-to-end lineage query;
-- a complete state-transition trace.
+- final independent per-object retention and Legal Hold read-back;
+- a complete lineage query or transition trace.
 
-No claim of `P0-16` readiness is made.
+No claim of `P0-16` pilot readiness is made.
 
-## 12. Preserved evidence and cleanup
+## 10. Preserved evidence and cleanup
 
-Sanitized diagnostic evidence was written before Docker cleanup:
+Sanitized evidence was written before Docker cleanup:
 
-- Evidence directory:
-  `/private/tmp/smartcoat-wp10-evidence-f6e35dadc528`
+- Evidence directory: `/private/tmp/smartcoat-wp10-evidence-3fcaebe0c6ec`
 - Pre-cleanup partial evidence SHA-256:
-  `7f8fe2ca4741c5a5023fabcc904be87a289a0c35a63299a14b8e3c0100a86f5f`
+  `5593eaa0b0df14e6c6a7095530741ee6754f0ed3450f4d2a5901b4e996491b0a`
 - Pre-cleanup manifest SHA-256:
-  `41a7e62e99f481156b797efac2675f59eb20e6fba765c8fdfd6485f3383ee437`
+  `89ca72bd64d61e9764961d37d1a6ee6b8ccf399113f12e242c718c6807252cec`
 - Final sanitized evidence SHA-256:
-  `e1fc4a18843f2057fb979822f6285f3fa9782e687ad278aa59041d0a287d9c15`
+  `920bf7ec06be557cb85abe2573a59e55eb0ff05500beeb5eaef6fdee1904e0e3`
 
 Docker inventory before and after cleanup:
 
 - Containers: `11 → 11`
 - Networks: `12 → 12`
 - Volumes: `7 → 7`
-- Inventory fingerprint:
+- Inventory fingerprint before and after:
   `6a8679177eb1436031a46b8e6b948abd9f4e977373ac48e0cfa9b42287b81de6`
-  before and after
 - Owned resources remaining: zero containers, zero networks, zero volumes
 
-No Bronze object was deleted, shortened, or released through a normal runtime
-operation. The entire owned disposable MinIO volume was removed only during the
-mandatory acceptance cleanup after evidence preservation.
+No normal-runtime delete, shortening, or Legal Hold release was invoked. The
+owned disposable MinIO volume was removed only by mandatory finalization after
+evidence preservation.
 
-## 13. Gate status
+## 11. Verification results retained before the pilot
 
-- `P0-16`: `FAILED_OPEN_DEFECT`
-- `P0-16-DEFECT-01`: `OPEN`
-- Platform: `BLOCKED`
-- Real company data: `PROHIBITED`
-- M0-R05, fresh-volume switch, `main` merge, and PR: not started
-
-## 14. Non-live regression results
-
-These checks ran once after the fail-closed stop; the live pilot was not rerun.
-
-- `ruff 0.12.11 check apps scripts infra`: exit `0`, all checks passed
-- MinIO offline suite: exit `0`, `23` passed
-- Network offline suite: exit `0`, `14` passed
-- PostgreSQL offline suite: exit `0`, `128` passed, `17` skipped external
-- Migration lifecycle focused regression: exit `0`
-- Migration rollback focused regression: exit `0`
-- Migration lock focused regression: exit `0`
-- Migration checksum/name-drift focused regression: exit `0`
-- Migration history-drift focused regression: exit `0`
-- Review atomicity focused regression: exit `0`
-- State-transition focused regression: exit `0`
-- API suite: exit `0`, `82` passed
-- OCR suite: exit `0`, `12` passed
-- Generator Python compilation: exit `0`
-- `docker compose --env-file .env.example config --quiet`: exit `0`
+- Solo-review focused acceptance: `15` passed
+- P0-16 focused OCR recovery suite before fix at `a824ad1`: failed as expected
+  with attempt count `0` instead of `1`
+- P0-16 focused OCR recovery suite after fix: `12` passed
+- API suite after fix: `85` passed
+- OCR suite after fix: `12` passed
+- PostgreSQL offline suite after fix: `128` passed, `17` external checks skipped
+- Python compilation of affected files: exit `0`
+- Compose render: exit `0`
+- Repository scan: `AT-14 passed`
 - `git diff --check`: exit `0`
+- Ruff was not installed in the local host environment and was not run
 
-The green offline suites do not override the live failure. In particular, the
-existing retry test injects failure only after `start_ocr_run()` and therefore
-does not exercise `P0-16-DEFECT-01`.
+No baseline command was rerun after the live pilot stopped.
 
-Protected migration and governance hashes remained unchanged:
+## 12. Protected hashes
 
 - `0001`: `7f34c9aba3819a49a5bb6c83f75bceaf436009d36c1c62eb46d0ddfa425529e5`
 - `0002`: `1f3f3b3faa3340c503bad0e844b08af6af5312546a35c5d2ab399fd6e105dffe`
@@ -309,3 +282,16 @@ Protected migration and governance hashes remained unchanged:
 - ADR-0002: `307ce9d9484b3819d16c5178a3dc61fb56e257376779e679e4923b1e7f5beb37`
 - Contract-freeze matrix:
   `cece377662dcb5224fa70226e4200f14017745615a6b31024c792cdc9d33de12`
+
+## 13. Gate status
+
+- WP11 prerequisite: `COMPLETE`
+- `P0-16-DEFECT-01`: `FIXED_AND_REGRESSION_VERIFIED`
+- WP10 live pilot: `BLOCKED_VERIFICATION_HARNESS`
+- Fixture 1: `IN_PROGRESS_AT_SILVER_DRAFT_READY_WHEN_DISPOSABLE_RUN_ENDED`
+- Fixture 2: `BOUNDED_OCR_FAILURE_PRODUCT_PATH_VERIFIED`
+- Fixtures 3–10: `NOT_STARTED_IN_RESUMED_RUN`
+- Orphan-window decision: `UNRESOLVED`; existing deferral unchanged
+- M0-R05: `NOT_STARTED`
+- Platform: `BLOCKED`
+- Real company data: `PROHIBITED`
