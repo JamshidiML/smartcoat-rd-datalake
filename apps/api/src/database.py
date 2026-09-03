@@ -572,14 +572,14 @@ class PostgresRepository:
                 "SELECT state FROM uploads WHERE ingestion_id = %s FOR UPDATE",
                 (ingestion_id,),
             ).fetchone()
-            if not upload or upload["state"] not in {"BRONZE_COMMITTED", "OCR_QUEUED"}:
-                raise StateConflict("OCR cannot be queued before a successful Bronze pair commit")
             existing = connection.execute(
                 "SELECT ocr_job_id FROM ocr_jobs WHERE ingestion_id = %s",
                 (ingestion_id,),
             ).fetchone()
             if existing:
                 return str(existing["ocr_job_id"])
+            if not upload or upload["state"] not in {"BRONZE_COMMITTED", "OCR_QUEUED"}:
+                raise StateConflict("OCR cannot be queued before a successful Bronze pair commit")
             connection.execute(
                 """
                 INSERT INTO ocr_jobs (ocr_job_id, ingestion_id, status, queued_at_utc, attempt_count)

@@ -227,6 +227,50 @@ class BronzePairFailureTests(unittest.TestCase):
         self.assertEqual(1, len(repository.jobs))
         self.assertEqual(1, len(repository.reconciliations))
 
+    def test_completed_lifecycle_reconciliation_reuses_existing_job(self) -> None:
+        for state in ("VERIFIED", "REVIEW_REJECTED", "OCR_FAILED"):
+            with self.subTest(state=state):
+                service, repository, _ = self.service()
+                result = self.ingest(service)
+                ingestion_id = result["ingestion_id"]
+                repository.uploads[ingestion_id]["state"] = state
+
+                replay = service.reconcile(ingestion_id)
+
+                self.assertEqual("ALREADY_COMMITTED", replay["status"])
+                self.assertEqual(result["ocr_job_id"], replay["ocr_job_id"])
+                self.assertEqual(1, len(repository.pairs))
+                self.assertEqual(1, len(repository.jobs))
+
+    def test_postgres_completed_replay_reads_existing_job_before_state_guard(self) -> None:
+        source = (SOURCE / "database.py").read_text()
+        method = source[
+            source.index("    def ensure_ocr_queued(") :
+            source.index("    def retry_failed_ocr(")
+        ]
+        lock_position = method.index("SELECT state FROM uploads")
+        existing_job_position = method.index("SELECT ocr_job_id FROM ocr_jobs")
+        state_guard_position = method.index(
+            'if not upload or upload["state"] not in'
+        )
+        insert_position = method.index("INSERT INTO ocr_jobs")
+
+        self.assertLess(lock_position, existing_job_position)
+        self.assertLess(existing_job_position, state_guard_position)
+        self.assertLess(state_guard_position, insert_position)
+
+    def test_reconciliation_before_pair_commit_still_cannot_queue_ocr(self) -> None:
+        service, repository, _ = self.service(storage=FaultStorage("original_upload"))
+        with self.assertRaises(RuntimeError):
+            self.ingest(service)
+        ingestion_id = next(iter(repository.uploads))
+
+        with self.assertRaisesRegex(StateConflict, "Protected Bronze pair is incomplete"):
+            service.reconcile(ingestion_id)
+
+        self.assertFalse(repository.pairs)
+        self.assertFalse(repository.jobs)
+
     def test_stale_conflicting_reconciliation_never_commits_or_queues(self) -> None:
         repository = ConflictingContextRepository()
         repository.bronze_fault_checkpoint = "before_commit"
