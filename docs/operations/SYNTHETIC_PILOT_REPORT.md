@@ -2,46 +2,43 @@
 
 ## Decision
 
-**Result: `FAIL_SYNTHETIC_END_TO_END_PILOT`**
+**Result: `PASS_SYNTHETIC_END_TO_END_PILOT`**
 
-The repaired evidence instrument completed all ten fixture paths and the first
-three fault scenarios. It then stopped at the first new product-contract
-failure, as required.
+The result is a composition of two preserved, sanitized executions. The first
+completed fixtures 1–10 and fault scenarios 1–3, then stopped on
+`P0-16-DEFECT-02` at fault scenario 4. After the independently scoped WP13 fix,
+the second execution resumed at fault scenario 4 and ran only scenarios 4–7.
+Fixtures 1–10 and fault scenarios 1–3 were not rerun.
 
-Defect identifier: `P0-16-DEFECT-02`.
+`P0-16-DEFECT-02` is closed. `PostgresRepository.ensure_ocr_queued()` now locks
+the upload row and returns an existing OCR job before applying the state guard
+that controls creation of a new job. The creation guard itself is unchanged:
+without an existing job, OCR remains unqueueable unless the ingestion is
+`BRONZE_COMMITTED` or `OCR_QUEUED`. This makes reconciliation read-idempotent
+after lifecycle advancement without weakening the pre-commit boundary.
 
-Calling Bronze reconciliation for an already `VERIFIED` ingestion returned HTTP
-`409` with `OCR cannot be queued before a successful Bronze pair commit`, rather
-than the intended idempotent `ALREADY_COMMITTED` result. Source inspection
-confirms the cause: `BronzeIngestionService.reconcile()` detects the existing
-pair but calls `ensure_ocr_queued()` before returning `ALREADY_COMMITTED`.
-`ensure_ocr_queued()` rejects every state except `BRONZE_COMMITTED` and
-`OCR_QUEUED` before it checks for the existing OCR job. Consequently the replay
-contract becomes unreachable once a completed ingestion advances to
-`SILVER_DRAFT_READY`, `UNDER_HUMAN_REVIEW`, `VERIFIED`, or `REVIEW_REJECTED`.
-
-This is `FAIL_PRODUCT_CONTRACT`, not a harness failure. No product fix was made,
-and the pilot was not rerun after the finding. The remaining fault scenarios
-were not executed.
-
-`P0-16-DEFECT-01` remains closed: pre-run OCR failures were counted exactly
-once, and the retry bound was enforced at three attempts in this live run.
+`P0-16-DEFECT-01` also remains closed: pre-run OCR failures were counted exactly
+once, and the retry bound was enforced at three attempts in both relevant live
+observations.
 
 ## 1. Execution identity
 
 - Execution date UTC: `2026-09-03`
 - Local report date (Europe/Berlin): `2026-09-04`
 - Branch: `agent/wp10-synthetic-pilot`
-- Candidate commit: `45a299ab76699d9da03a6b1e179ffef635ae8fee`
+- Fixture/fault-1–3 commit: `45a299ab76699d9da03a6b1e179ffef635ae8fee`
+- Fault-4–7 candidate commit: `b030a0b7288f663ca9af85f051494c3d342d1a69`
 - Integration base: `a824ad1d0bb9d3b36187162c5ba1ee2c800bbfab`
 - Disposable project: `bronzepair-d6884a43cf6e`
 - Synthetic data only: yes
 - Existing containers, volumes, networks, `./.local-data/`, archives, and real
   company data accessed: no
+- Fault-4–7 disposable project: `bronzepair-47e63b3673a9`
 
 Immutable images:
 
 - API: `sha256:fc1aee8b138354a98f30f064533a082bb73dfd72383b653f6c17fef906d051ec`
+- WP13 API: `sha256:b6ebad7011dc3494ebabf5729d966f776ec8a3ff140ede49d9dc5e61acd25b4b`
 - OCR worker: `sha256:fd8dfe1cb15204b3b0f956b491900ba6348e9ba94ccd52c8f59e1d0a69e54545`
 - Legal Hold mediator: `sha256:bbb170b5a8eed05a179db672e7528b222e8c93c433ffdf79605fd9e8045d57ef`
 - PostgreSQL: `sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94`
@@ -50,7 +47,8 @@ Immutable images:
 
 Embedded candidate source hashes matched the repository:
 
-- `apps/api/src/database.py`: `4189a4863c84736d2638c5462ac41909795c54ea544cbe65eab67adc0203d005`
+- `apps/api/src/database.py` in the WP13 image:
+  `c873bdf1de826d71f5a2895d03ee9461d0ed70f425ac96d219dff23b739dd7f9`
 - `apps/api/src/domain.py`: `3159f4860a760375724f16017cb8fc65ebd09fe53f09be9ded12841195aa36d5`
 - `apps/api/src/main.py`: `0678fb4dc5814d92e46ced6d2984e18acf17da86d10355e2887654d0e72e280c`
 - `apps/api/src/storage.py`: `b40b13f3a217d04e1216ddfdc517af028e3f97c8ba653863e594e110f9e8f087`
@@ -217,27 +215,32 @@ discovery and recovery succeeded through the ordinary application boundary.
 - Recoverable on the same ingestion: no.
 - Recoverable by explicit provenance-preserving re-upload: yes.
 
-### 7.4 Retry already-completed ingestion — FAIL
+### 7.4 Retry already-completed ingestion — PASS after WP13
 
 - Target state before the request: `VERIFIED`.
 - Endpoint: `POST /api/uploads/{ingestion_id}/reconcile-bronze`.
-- Actual result: HTTP `409`.
-- Actual classification: `StateConflict`.
-- Actual reason: `OCR cannot be queued before a successful Bronze pair commit`.
-- Expected result: idempotent `ALREADY_COMMITTED` with the existing OCR job and
-  no additional pair, object, or job.
+- Result: HTTP `200`, `ALREADY_COMMITTED`.
+- Pair rows before/after: `1 → 1`.
+- Bronze object rows before/after: `2 → 2`.
+- OCR jobs before/after: `1 → 1`.
+- State before/after: `VERIFIED → VERIFIED`.
+- The complete independently queried before/after snapshots were equal.
 
-The source path rejects before returning its documented existing-pair result.
-The disposable database was cleaned after evidence preservation, so this report
-does not substitute a post-cleanup inference for a retained after-state query.
+The regression was written before the fix and failed at `1e4a6f22`: the static
+production-order assertion proved the existing-job lookup followed the state
+guard. After the narrow ordering repair, the focused Bronze-pair suite passed
+`13/13`. The same suite also reconciles `VERIFIED`, `REVIEW_REJECTED`, and
+`OCR_FAILED` through the domain boundary and retains the negative pre-pair
+case.
 
-### 7.5 Concurrent reviews — product boundary observed before stop
+### 7.5 Concurrent reviews — PASS
 
-- One review returned HTTP `200` and created the verified outcome.
-- The competing review returned expected HTTP `422` with `The Silver draft
-  already has a different effective review decision`.
-- The later dedicated database count was not reached because fault 7.4 stopped
-  execution; no stronger exactly-one database claim is made here.
+- Responses: one HTTP `200`, one expected HTTP `422`.
+- Persisted review decisions: exactly `1`.
+- Persisted verified records: exactly `1`.
+- Final state: `VERIFIED`.
+- The rejected response retained the expected different-effective-decision
+  classification.
 
 ### 7.6 Bounded OCR retry — PASS
 
@@ -246,9 +249,26 @@ does not substitute a post-cleanup inference for a retained after-state query.
 - Terminal state for both: `OCR_FAILED`.
 - Bronze evidence remained preserved.
 
-### 7.7 PostgreSQL killed after storage enforcement before evidence insert
+The resumed fault-6 execution independently observed counts `1`, `2`, and `3`,
+then an expected HTTP `409`; its final state was `OCR_FAILED`.
 
-`NOT_RUN_AFTER_FAIL_CLOSED_STOP`.
+### 7.7 PostgreSQL killed after storage enforcement before evidence insert — PASS
+
+Before reconciliation, the retained database snapshot showed `RECEIVED` with
+zero pair, object, orphan, reconciliation, and OCR-job rows. The failed client
+observed HTTP `500` after both exact MinIO versions had been stored and
+protected.
+
+The ordinary application identity then rediscovered the exact original and
+manifest versions and reconciliation returned `RECONCILED`. The resulting state
+contained exactly one pair, two Bronze object rows, two durable orphan-evidence
+rows, one reconciliation row, and one OCR job. Repeated reconciliation returned
+`ALREADY_COMMITTED` without changing those counts.
+
+Both exact versions independently read back with matching SHA-256,
+`COMPLIANCE` retention, a present retain-until value, and Legal Hold `ON`.
+No invisible orphan was observed; the deferred orphan discovery sweep remains
+P2.
 
 ## 8. Observed state transitions and lineage
 
@@ -265,8 +285,10 @@ The retained structured logs observed only accepted edges, including:
 - `UNDER_HUMAN_REVIEW → VERIFIED`
 - `UNDER_HUMAN_REVIEW → REVIEW_REJECTED`
 
-The final aggregate transition and lineage queries were after the failing fault
-and were not reached. No complete-graph or final-lineage claim is made.
+The first execution retained the accepted fixture transition evidence. The
+resume execution intentionally did not recreate fixtures 1–10 merely to produce
+a combined aggregate; its fault-specific snapshots and counts are direct live
+queries, not inferred results.
 
 ## 9. Structured correlation evidence
 
@@ -279,9 +301,10 @@ The protected-write orphan recovery retained one correlation chain with:
 - Pair identity and exact original/manifest versions retained in the sanitized
   evidence file.
 
-The completed-ingestion replay failure retained correlation ID
-`b0bae51a-1a87-4556-8247-30ef8240f94b`, the `StateConflict` classification,
-reason, request path, and HTTP `409` completion record.
+The original completed-ingestion failure remains retained as defect evidence.
+The repaired replay used ingestion
+`01a06976-c8e6-795e-a63f-77c4fb1cbfd8` and returned the existing OCR job with
+HTTP `200 ALREADY_COMMITTED` while leaving its exact snapshot unchanged.
 
 No Bearer token, password, MinIO credential, database URL, or raw Authorization
 header is present in the retained structured evidence.
@@ -296,19 +319,20 @@ changing repository product code:
 2. The protection query selected nonexistent `e.outcome` instead of migration
    `0007`'s `e.enforcement_verification_result`.
 
-Both instrument changes were preserved as standalone diffs. The final run then
-stopped on `P0-16-DEFECT-02`; that product defect was not fixed.
+Both instrument changes were preserved as standalone diffs. The WP13 resume
+instrument initially failed because a retained helper's default evidence path
+was bound before the helper module was rebound. That generated project was
+ownership-cleaned to zero resources before a rerun. The instrument was repaired
+outside the repository to own its evidence path directly; no product code was
+changed by that repair.
 
 ## 11. What this pilot did not prove
 
-The stopped run did not prove:
-
-- idempotent completed-ingestion reconciliation;
-- a final database count of exactly one effective concurrent-review decision;
-- fault 7.7, the retention-evidence insertion failure window;
-- the final all-object protection audit after every fault-created ingestion;
-- a final aggregate lineage result or complete transition trace;
-- OCR transcription accuracy, which was explicitly outside scope.
+The completed pilot did not score OCR transcription accuracy. That was
+explicitly outside this synthetic contract pilot's scope. It also does not
+claim that the two preserved executions share one database; the authorized
+resume used a fresh disposable project and carried forward the authenticated
+first-run evidence rather than rerunning completed work.
 
 ## 12. Evidence preservation and cleanup
 
@@ -319,6 +343,14 @@ The stopped run did not prove:
   `4cb43068bc7d41dbe0a057054abde9bf0572e9d5105ac84dc0d555f72067fbf0`
 - Final sanitized evidence SHA-256:
   `120eb887c8e0fd79b90c2c380357c95b2dab53b876d99395db926eac2002682d`
+- WP13 fault-4–7 evidence directory:
+  `/private/tmp/smartcoat-wp13-evidence-e9b22ee55478`
+- WP13 fault-4–7 final sanitized evidence SHA-256:
+  `6530fba65898288a21315e78f08a33ff4996f56e217fc0ebef0899d065fcf9b2`
+- WP13 resume-instrument file SHA-256:
+  `c06a129a33a1ba7a32856c809c4746fa5a01684f41db2e50b33b8cb7cdb4755c`
+- WP13 resume-instrument no-index diff: `592` lines, SHA-256
+  `9050278372dfa73503ebf586de089f021d191c86fe74a1794ecc4ab69fbebcbf`
 
 Docker inventory before and after cleanup:
 
@@ -329,12 +361,19 @@ Docker inventory before and after cleanup:
   `6a8679177eb1436031a46b8e6b948abd9f4e977373ac48e0cfa9b42287b81de6`
 - Owned resources remaining: zero containers, zero networks, zero volumes
 
+The WP13 resume execution independently observed the same `11/12/7` counts and
+the same inventory fingerprint before and after cleanup. Its generated project
+also had zero remaining containers, networks, and volumes.
+
 ## 13. Retained regression and CI evidence
 
 - Solo-review focused acceptance: `15` passed
 - P0-16 focused suite before fix at `a824ad1`: failed as expected
-- P0-16 focused suite after fix: `12` passed
-- API suite: `85` passed
+- P0-16 focused suite after attempt-accounting fix: `12` passed
+- WP13 Bronze-pair regression before fix at `1e4a6f22`: `13` run, `1` expected
+  failure in the production-order assertion
+- WP13 Bronze-pair regression after fix: `13` passed
+- API suite after WP13: `88` passed
 - OCR suite: `12` passed
 - PostgreSQL offline suite: `128` passed, `17` external checks skipped
 - Python compilation: exit `0`
@@ -344,8 +383,9 @@ Docker inventory before and after cleanup:
 - Offline repaired-client classification check: pass for expected HTTP `400`,
   `409`, `413`, `415`, and `422`; unexpected HTTP `500`; and transport failure
 
-No test was weakened. No migration, production source, policy, credential,
-state, or transition edge was changed by the pilot.
+No test was weakened. WP13 changed only the existing-job/state-guard ordering
+and its regression tests. No migration, policy, credential, state, transition
+edge, unique constraint, or RBAC grant changed.
 
 ## 14. Protected hashes
 
@@ -372,11 +412,9 @@ state, or transition edge was changed by the pilot.
 - Base Bronze exact-version protection: `PASS`
 - Corrected fixture-7 provenance: `PASS`
 - Faults 7.1–7.3: `PASS`
-- Fault 7.4: `FAIL_PRODUCT_CONTRACT`
-- Faults 7.5–7.6: `OBSERVED_BEFORE_STOP`
-- Fault 7.7: `NOT_RUN`
-- `P0-16-DEFECT-02`: `OPEN`
-- WP10: `BLOCKED`
+- Faults 7.4–7.7: `PASS`
+- `P0-16-DEFECT-02`: `CLOSED`
+- WP10: `PASS_SYNTHETIC_END_TO_END_PILOT`
 - M0-R05: `NOT_STARTED`
 - Platform: `BLOCKED`
 - Real company data: `PROHIBITED`
