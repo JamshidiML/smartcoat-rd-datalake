@@ -1314,13 +1314,16 @@ class PostgresRepository:
             failed_job = connection.execute(
                 """
                 UPDATE ocr_jobs SET status = 'FAILED', error_reason = %s,
-                    completed_at_utc = now()
+                    completed_at_utc = now(),
+                    attempt_count = attempt_count + CASE WHEN status = 'QUEUED' THEN 1 ELSE 0 END
                 WHERE ocr_job_id = %s AND status IN ('QUEUED', 'RUNNING')
+                RETURNING attempt_count
                 """,
                 (reason[:1000], context["ocr_job_id"]),
-            )
-            if failed_job.rowcount != 1:
+            ).fetchone()
+            if not failed_job:
                 raise StateConflict("OCR job is not fail-able")
+            attempt_count = int(failed_job["attempt_count"])
             failed_run = connection.execute(
                 """
                 UPDATE ocr_runs SET status = 'FAILED', completed_at_utc = now()
@@ -1339,7 +1342,7 @@ class PostgresRepository:
                 "FAILED",
                 {
                     "ingestion_id": ingestion_id,
-                    "attempt_count": context["attempt_count"],
+                    "attempt_count": attempt_count,
                     "error_reason": reason[:1000],
                     "ocr_run_id": (
                         str(failed_run["ocr_run_id"]) if failed_run else None
@@ -1366,7 +1369,7 @@ class PostgresRepository:
                 "OCR_FAILED",
                 {
                     "ocr_job_id": str(context["ocr_job_id"]),
-                    "attempt_count": context["attempt_count"],
+                    "attempt_count": attempt_count,
                     "reason": reason[:500],
                     "original_object_version_id": context["original_object_version_id"],
                 },

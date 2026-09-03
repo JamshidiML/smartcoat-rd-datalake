@@ -81,6 +81,35 @@ class OCRFailedRecoveryTests(unittest.TestCase):
         self.assertEqual("FAILED", self.repository.jobs[self.job_id]["status"])
         self.assertEqual("OCR_FAILED", self.repository.uploads[self.ingestion_id]["state"])
 
+    def test_pre_run_failures_count_each_attempt_and_reach_retry_limit(self) -> None:
+        for attempt in range(1, 4):
+            self.repository.mark_ocr_failed(
+                self.ingestion_id,
+                f"synthetic pre-start failure {attempt}",
+            )
+            self.assertEqual(
+                attempt,
+                self.repository.jobs[self.job_id]["attempt_count"],
+            )
+            if attempt < 3:
+                self.recovery.retry(self.ingestion_id, ACTOR)
+
+        with self.assertRaisesRegex(StateConflict, "OCR retry limit reached"):
+            self.recovery.retry(self.ingestion_id, ACTOR)
+        self.assertFalse(self.repository.runs)
+        self.assertEqual("FAILED", self.repository.jobs[self.job_id]["status"])
+        self.assertEqual("OCR_FAILED", self.repository.uploads[self.ingestion_id]["state"])
+
+    def test_database_failure_path_counts_only_jobs_that_have_not_started(self) -> None:
+        source = (SOURCE / "database.py").read_text(encoding="utf-8")
+        failure_body = source.split("def mark_ocr_failed", 1)[1]
+        failure_update = failure_body.split("UPDATE ocr_runs", 1)[0]
+        self.assertIn(
+            "attempt_count = attempt_count + CASE WHEN status = 'QUEUED' THEN 1 ELSE 0 END",
+            failure_update,
+        )
+        self.assertIn("RETURNING attempt_count", failure_update)
+
     def test_recovery_does_not_change_bronze_or_storage_protection(self) -> None:
         self.fail_attempt()
         before = deepcopy(
