@@ -264,8 +264,10 @@ networks:
   edge:
     name: {project}-edge
 ''')
-    seed = root / "seed.py"; seed.write_text(SEED_PROGRAM)
-    object_check = root / "objects.py"; object_check.write_text(OBJECT_PROGRAM)
+    seed = root / "seed.py"
+    seed.write_text(SEED_PROGRAM)
+    object_check = root / "objects.py"
+    object_check.write_text(OBJECT_PROGRAM)
     compose_file = f"{ROOT / 'compose.yaml'}:{override}"
     environment = docker_environment({
         **values, "ENV_FILE": str(env_file), "COMPOSE_FILE": compose_file,
@@ -295,8 +297,10 @@ networks:
         evidence["backup"] = {"marker": result.stdout.strip(), "seconds": round(time.monotonic() - backup_start, 3), "postgres_sha256": digest((backup / "postgres.dump").read_bytes()), "manifest_sha256": digest((backup / "SHA256SUMS").read_bytes())}
 
         compose("down", "--remove-orphans", timeout=300)
-        shutil.rmtree(postgres_data); shutil.rmtree(minio_data)
-        postgres_data.mkdir(mode=0o700); minio_data.mkdir(mode=0o700)
+        shutil.rmtree(postgres_data)
+        shutil.rmtree(minio_data)
+        postgres_data.mkdir(mode=0o700)
+        minio_data.mkdir(mode=0o700)
         evidence["destruction"] = {"postgres_empty": not any(postgres_data.iterdir()), "minio_empty": not any(minio_data.iterdir())}
 
         restore_start = time.monotonic()
