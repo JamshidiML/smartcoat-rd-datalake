@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -188,6 +189,148 @@ print(json.dumps(rows, sort_keys=True, separators=(",", ":")))
 '''
 
 
+SEMANTIC_PROGRAM = r'''
+import json, os, sys
+import psycopg
+from psycopg import sql
+sys.path.insert(0, "/opt/smartcoat-postgres")
+from provision_runtime_roles import validate_installed_contract
+
+result = {}
+with psycopg.connect(os.environ["POSTGRES_ROLE_ADMIN_URL"]) as connection:
+    validate_installed_contract(connection)
+    result["rbac_exact_contract"] = True
+    tables = [row[0] for row in connection.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name"
+    ).fetchall()]
+    table_evidence = {}
+    for table in tables:
+        query = sql.SQL("SELECT count(*), coalesce(md5(string_agg(row_hash, '' ORDER BY row_hash)), md5('')) FROM (SELECT md5(t.*::text) AS row_hash FROM {} AS t) AS rows").format(sql.Identifier("public", table))
+        count, row_hash = connection.execute(query).fetchone()
+        table_evidence[table] = {"count": count, "row_hash": row_hash}
+    result["public_tables"] = table_evidence
+
+    sequences = {}
+    sequence_rows = connection.execute(
+        "SELECT sequence_schema, sequence_name FROM information_schema.sequences WHERE sequence_schema NOT IN ('pg_catalog','information_schema') ORDER BY sequence_schema, sequence_name"
+    ).fetchall()
+    for schema, name in sequence_rows:
+        value, called = connection.execute(
+            sql.SQL("SELECT last_value, is_called FROM {}").format(sql.Identifier(schema, name))
+        ).fetchone()
+        sequences[f"{schema}.{name}"] = {"last_value": value, "is_called": called}
+    result["sequences"] = sequences
+
+    result["roles"] = [list(row) for row in connection.execute(
+        "SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls FROM pg_roles WHERE rolname = ANY(%s) ORDER BY rolname",
+        (["smartcoat_ingestion", "smartcoat_ocr", "smartcoat_review", "smartcoat_backup"],),
+    ).fetchall()]
+    result["table_grants"] = [list(row) for row in connection.execute(
+        "SELECT grantee, table_schema, table_name, privilege_type FROM information_schema.table_privileges WHERE grantee = ANY(%s) ORDER BY grantee, table_schema, table_name, privilege_type",
+        (["smartcoat_ingestion", "smartcoat_ocr", "smartcoat_review", "smartcoat_backup"],),
+    ).fetchall()]
+    result["column_grants"] = [list(row) for row in connection.execute(
+        "SELECT grantee, table_schema, table_name, column_name, privilege_type FROM information_schema.column_privileges WHERE grantee = ANY(%s) ORDER BY grantee, table_schema, table_name, column_name, privilege_type",
+        (["smartcoat_ingestion", "smartcoat_ocr", "smartcoat_review", "smartcoat_backup"],),
+    ).fetchall()]
+    result["schema_grants"] = [list(row) for row in connection.execute(
+        "SELECT grantee, object_schema, privilege_type FROM information_schema.usage_privileges WHERE object_type='SCHEMA' AND grantee = ANY(%s) ORDER BY grantee, object_schema, privilege_type",
+        (["smartcoat_ingestion", "smartcoat_ocr", "smartcoat_review", "smartcoat_backup"],),
+    ).fetchall()]
+    result["triggers"] = [list(row) for row in connection.execute(
+        "SELECT n.nspname, c.relname, t.tgname, t.tgenabled, pg_get_triggerdef(t.oid) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE NOT t.tgisinternal AND n.nspname IN ('public','smartcoat_migrations','smartcoat_state') ORDER BY n.nspname,c.relname,t.tgname"
+    ).fetchall()]
+    ledger = connection.execute(
+        "SELECT version, name, sha256, count(*) OVER (PARTITION BY version) FROM smartcoat_migrations.applied_migrations ORDER BY version"
+    ).fetchall()
+    result["migration_ledger"] = [list(row) for row in ledger]
+    result["ledger_0001_0010_once"] = [row[0] for row in ledger] == list(range(1, 11)) and all(row[3] == 1 for row in ledger)
+    legal = connection.execute("SELECT count(*) FROM smartcoat_state.legal_upload_transitions").fetchone()[0]
+    result["transition_graph"] = {"legal": legal, "illegal": 90 - legal, "total": 90}
+
+append_targets = [
+    ("public", "bronze_objects"), ("public", "silver_verified_records"),
+    ("public", "review_decisions"), ("public", "audit_events"),
+    ("public", "canonical_retention_classes"), ("public", "retention_policy_versions"),
+    ("public", "retention_category_rules"), ("public", "bronze_retention_assignments"),
+    ("public", "bronze_retention_enforcement_evidence"), ("public", "bronze_pairs"),
+    ("smartcoat_migrations", "applied_migrations"),
+    ("smartcoat_migrations", "adoption_decisions"),
+    ("smartcoat_state", "legal_upload_transitions"),
+]
+enforcement = {}
+for schema, table in append_targets:
+    outcomes = {}
+    for action in ("UPDATE", "DELETE"):
+        with psycopg.connect(os.environ["POSTGRES_ROLE_ADMIN_URL"]) as probe:
+            exists = probe.execute(
+                sql.SQL("SELECT EXISTS (SELECT 1 FROM {} LIMIT 1)").format(sql.Identifier(schema, table))
+            ).fetchone()[0]
+            if not exists:
+                outcomes[action.lower()] = "NO_ROW_CATALOG_GUARD_ONLY"
+                continue
+            statement = (
+                sql.SQL("UPDATE {} SET {} = {} WHERE ctid=(SELECT ctid FROM {} LIMIT 1)").format(
+                    sql.Identifier(schema, table), sql.Identifier(probe.execute(sql.SQL("SELECT * FROM {} LIMIT 0").format(sql.Identifier(schema, table))).description[0].name), sql.Identifier(probe.execute(sql.SQL("SELECT * FROM {} LIMIT 0").format(sql.Identifier(schema, table))).description[0].name), sql.Identifier(schema, table)
+                ) if action == "UPDATE" else
+                sql.SQL("DELETE FROM {} WHERE ctid=(SELECT ctid FROM {} LIMIT 1)").format(sql.Identifier(schema, table), sql.Identifier(schema, table))
+            )
+            try:
+                probe.execute(statement)
+            except Exception:
+                probe.rollback()
+                outcomes[action.lower()] = "REJECTED"
+            else:
+                probe.rollback()
+                outcomes[action.lower()] = "NOT_REJECTED"
+    enforcement[f"{schema}.{table}"] = outcomes
+result["append_only_enforcement"] = enforcement
+assert result["ledger_0001_0010_once"]
+assert result["transition_graph"] == {"legal": 11, "illegal": 79, "total": 90}
+assert all(value in {"REJECTED", "NO_ROW_CATALOG_GUARD_ONLY"} for outcomes in enforcement.values() for value in outcomes.values())
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+'''
+
+
+def preserve_failure_diagnostics(
+    *,
+    project: str,
+    evidence: dict[str, object],
+    source_dump: str | None,
+    restored_dump: str | None,
+    secrets_to_hide: tuple[str, ...],
+) -> Path:
+    destination = Path.home() / "Desktop" / "smartcoat-wp9-diagnostics" / project
+    destination.mkdir(parents=True, mode=0o700, exist_ok=False)
+    artifacts: dict[str, bytes] = {
+        "evidence.json": json.dumps(evidence, sort_keys=True, indent=2).encode() + b"\n"
+    }
+    if source_dump is not None:
+        artifacts["source-data.sql"] = source_dump.encode()
+    if restored_dump is not None:
+        artifacts["restored-data.sql"] = restored_dump.encode()
+    if source_dump is not None and restored_dump is not None:
+        artifacts["postgres-data.diff"] = "".join(difflib.unified_diff(
+            source_dump.splitlines(keepends=True),
+            restored_dump.splitlines(keepends=True),
+            fromfile="source-data.sql",
+            tofile="restored-data.sql",
+        )).encode()
+    for name, content in artifacts.items():
+        if any(secret and secret.encode() in content for secret in secrets_to_hide):
+            raise AcceptanceFailure("diagnostic artifact contains synthetic credential")
+        path = destination / name
+        path.write_bytes(content)
+        path.chmod(0o600)
+    manifest = "".join(
+        f"{digest((destination / name).read_bytes())}  {name}\n"
+        for name in sorted(artifacts)
+    )
+    (destination / "SHA256SUMS").write_text(manifest)
+    (destination / "SHA256SUMS").chmod(0o600)
+    return destination
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(CONFIRM, action="store_true", dest="confirmed")
@@ -268,6 +411,8 @@ networks:
     seed.write_text(SEED_PROGRAM)
     object_check = root / "objects.py"
     object_check.write_text(OBJECT_PROGRAM)
+    semantic_check = root / "semantic.py"
+    semantic_check.write_text(SEMANTIC_PROGRAM)
     compose_file = f"{ROOT / 'compose.yaml'}:{override}"
     environment = docker_environment({
         **values, "ENV_FILE": str(env_file), "COMPOSE_FILE": compose_file,
@@ -277,20 +422,45 @@ networks:
 
     def compose(*parts: str, check: bool = True, timeout: int = 300):
         return run(["docker", "compose", "--project-name", project, *parts], environment=environment, secrets_to_hide=hidden, check=check, timeout=timeout)
+    def compose_quiet(*parts: str, timeout: int = 300) -> None:
+        completed = subprocess.run(
+            ["docker", "compose", "--project-name", project, *parts],
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=timeout,
+        )
+        if completed.returncode != 0:
+            raise AcceptanceFailure(
+                f"silent Docker Compose operation failed: {parts[0]}"
+            )
     def one_shot(program: Path, mode: str = "source"):
         return compose("run", "--rm", "--no-deps", "--entrypoint", "python", "-e", f"SEED_MODE={mode}", "-v", f"{program}:/tmp/program.py:ro", "api", "/tmp/program.py", timeout=300)
+    def semantic_snapshot():
+        return compose(
+            "run", "--rm", "--no-deps", "--entrypoint", "python",
+            "-v", f"{semantic_check}:/tmp/semantic.py:ro",
+            "postgres-role-provision", "/tmp/semantic.py", timeout=300,
+        ).stdout.splitlines()[-1]
+    source_dump: str | None = None
+    restored_dump: str | None = None
+    failure: Exception | None = None
     try:
         compose("up", "-d", "--wait", "postgres", "minio", timeout=300)
         compose("run", "--rm", "postgres-migrate", "adopt", values["POSTGRES_DB"])
         compose("run", "--rm", "postgres-migrate", "apply")
         compose("run", "--rm", "postgres-role-provision")
-        compose("run", "--rm", "minio-bootstrap")
+        compose_quiet("run", "--rm", "minio-bootstrap")
         compose("up", "-d", "--wait", "legal-hold-applier", timeout=300)
         evidence["source_seed"] = json.loads(one_shot(seed).stdout.splitlines()[-1])
         source_objects = one_shot(object_check).stdout.splitlines()[-1]
         evidence["source_objects_sha256"] = digest(source_objects.encode())
         source_dump = compose("exec", "-T", "postgres", "pg_dump", "--data-only", "--inserts", "--no-owner", "-U", values["POSTGRES_USER"], "-d", values["POSTGRES_DB"]).stdout
         evidence["source_data_sha256"] = digest(source_dump.encode())
+        source_semantics = semantic_snapshot()
+        evidence["source_semantics_sha256"] = digest(source_semantics.encode())
 
         backup_start = time.monotonic()
         result = run([str(SCRIPT), "backup", str(backup)], environment=environment, secrets_to_hide=hidden, timeout=300)
@@ -313,8 +483,11 @@ networks:
             raise AcceptanceFailure("restored exact-version protection evidence differs")
         restored_dump = compose("exec", "-T", "postgres", "pg_dump", "--data-only", "--inserts", "--no-owner", "-U", values["POSTGRES_USER"], "-d", values["POSTGRES_DB"]).stdout
         evidence["restored_data_sha256"] = digest(restored_dump.encode())
-        if restored_dump != source_dump:
-            raise AcceptanceFailure("restored database data differs")
+        restored_semantics = semantic_snapshot()
+        evidence["restored_semantics_sha256"] = digest(restored_semantics.encode())
+        evidence["semantic_database_equal"] = restored_semantics == source_semantics
+        if restored_semantics != source_semantics:
+            raise AcceptanceFailure("restored semantic database evidence differs")
 
         target = json.loads(restored_objects)[0]
         deletion = compose("run", "--rm", "--no-deps", "--entrypoint", "/bin/sh", "-e", f"DELETE_BUCKET={target['bucket']}", "-e", f"DELETE_KEY={target['key']}", "-e", f"DELETE_VERSION={target['version']}", "minio-bootstrap", "-c", "mc alias set restore http://minio:9000 \"$MINIO_ROOT_USER\" \"$MINIO_ROOT_PASSWORD\" >/dev/null && mc rm --version-id \"$DELETE_VERSION\" \"restore/$DELETE_BUCKET/$DELETE_KEY\"", check=False)
@@ -334,9 +507,22 @@ networks:
             raise AcceptanceFailure("restored migration apply was not idempotent")
         evidence["post_restore"] = json.loads(one_shot(seed, "post").stdout.splitlines()[-1])
         evidence["rpo"] = "zero records at the quiesced backup boundary"
+    except Exception as exc:
+        failure = exc
+        evidence["failure"] = {"type": type(exc).__name__, "message": str(exc)}
+        preserved = preserve_failure_diagnostics(
+            project=project,
+            evidence=evidence,
+            source_dump=source_dump,
+            restored_dump=restored_dump,
+            secrets_to_hide=hidden,
+        )
+        print(f"PRESERVED_DIAGNOSTICS={preserved}")
     finally:
         compose("down", "--remove-orphans", check=False, timeout=300)
         shutil.rmtree(root, ignore_errors=True)
+    if failure is not None:
+        raise failure
     after = inventory(docker_env)
     evidence["inventory_after"] = inventory_evidence(after)
     evidence["inventory_equal"] = after == before

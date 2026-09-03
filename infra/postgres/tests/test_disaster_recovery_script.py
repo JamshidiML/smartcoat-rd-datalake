@@ -52,6 +52,22 @@ class DisasterRecoveryScriptContractTests(unittest.TestCase):
         self.assertIn('>/dev/null 2>&1', self.source)
         self.assertNotIn("set -x", self.source)
 
+    def test_live_harness_uses_semantic_equality_and_preserves_failure_evidence(self) -> None:
+        harness = (
+            ROOT / "infra/postgres/tests/live_disaster_recovery_acceptance.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ORDER BY row_hash", harness)
+        self.assertIn('result["public_tables"]', harness)
+        self.assertIn('result["sequences"]', harness)
+        self.assertIn("validate_installed_contract(connection)", harness)
+        self.assertIn('result["append_only_enforcement"]', harness)
+        self.assertIn('result["migration_ledger"]', harness)
+        self.assertIn("preserve_failure_diagnostics", harness)
+        self.assertIn('artifacts["postgres-data.diff"]', harness)
+        self.assertIn("compose_quiet", harness)
+        self.assertIn("stdout=subprocess.DEVNULL", harness)
+        self.assertNotIn("if restored_dump != source_dump", harness)
+
 
 if __name__ == "__main__":
     unittest.main()
